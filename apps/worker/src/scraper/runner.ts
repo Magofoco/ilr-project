@@ -1,5 +1,6 @@
 import { prisma, Prisma, type SourceForum } from '@ilr/db';
-import type { SourceAdapter, ScrapedThread, ScrapedPost, ScrapeProgress } from '@ilr/shared';
+import type { SourceAdapter, ScrapedPost, ScrapeProgress } from '@ilr/shared';
+import { retryWithBackoff } from '@ilr/shared';
 import { extractCaseData } from '../extraction/extractor.js';
 import { hashContent, delay, getJitter } from '../utils/helpers.js';
 
@@ -15,12 +16,68 @@ interface RunScraperOptions {
 // Batch size for database operations
 const BATCH_SIZE = 50;
 
+// Pages to process before saving to DB (chunked processing)
+const PAGES_PER_CHUNK = 10;
+
 interface PostWithHash extends ScrapedPost {
   contentHash: string;
 }
 
+// Track current scrape run for graceful shutdown
+let currentScrapeRunId: string | null = null;
+let currentAdapter: SourceAdapter | null = null;
+let shutdownRequested = false;
+
+/**
+ * Graceful shutdown handler - called when SIGINT/SIGTERM received
+ */
+export async function gracefulShutdown(): Promise<void> {
+  shutdownRequested = true;
+  
+  // Mark current scrape run as failed if one is running
+  if (currentScrapeRunId) {
+    try {
+      await prisma.scrapeRun.update({
+        where: { id: currentScrapeRunId },
+        data: {
+          status: 'failed',
+          completedAt: new Date(),
+          errorMessage: 'Graceful shutdown requested',
+        },
+      });
+      console.log('  Marked scrape run as failed due to shutdown');
+    } catch (error) {
+      console.error('  Error updating scrape run:', error);
+    }
+  }
+  
+  // Cleanup adapter resources
+  if (currentAdapter?.cleanup) {
+    try {
+      await currentAdapter.cleanup();
+      console.log('  Cleaned up browser resources');
+    } catch (error) {
+      console.error('  Error cleaning up adapter:', error);
+    }
+  }
+  
+  // Disconnect from database
+  await prisma.$disconnect();
+}
+
+/**
+ * Check if shutdown was requested
+ */
+function shouldStop(): boolean {
+  return shutdownRequested;
+}
+
 export async function runScraper(options: RunScraperOptions): Promise<void> {
   const { source, adapter, since, maxThreads, dryRun, resume = true } = options;
+
+  // Reset shutdown flag
+  shutdownRequested = false;
+  currentAdapter = adapter;
 
   // Create scrape run record
   const scrapeRun = dryRun
@@ -36,6 +93,8 @@ export async function runScraper(options: RunScraperOptions): Promise<void> {
           },
         },
       });
+
+  currentScrapeRunId = scrapeRun?.id || null;
 
   let stats = {
     threadsFound: 0,
@@ -54,6 +113,11 @@ export async function runScraper(options: RunScraperOptions): Promise<void> {
 
     // Step 2: Process each thread
     for (let i = 0; i < threads.length; i++) {
+      if (shouldStop()) {
+        console.log('Shutdown requested, stopping...');
+        break;
+      }
+
       const thread = threads[i]!;
       console.log(`[${i + 1}/${threads.length}] Processing: ${thread.title.slice(0, 50)}...`);
 
@@ -64,61 +128,91 @@ export async function runScraper(options: RunScraperOptions): Promise<void> {
         // Get or create thread in DB
         const dbThread = dryRun
           ? null
-          : await prisma.thread.upsert({
-              where: {
-                sourceId_externalId: {
+          : await retryWithBackoff(
+              () => prisma.thread.upsert({
+                where: {
+                  sourceId_externalId: {
+                    sourceId: source.id,
+                    externalId: thread.externalId,
+                  },
+                },
+                create: {
                   sourceId: source.id,
                   externalId: thread.externalId,
+                  url: thread.url,
+                  title: thread.title,
+                  authorName: thread.authorName,
+                  postedAt: thread.postedAt,
                 },
-              },
-              create: {
-                sourceId: source.id,
-                externalId: thread.externalId,
-                url: thread.url,
-                title: thread.title,
-                authorName: thread.authorName,
-                postedAt: thread.postedAt,
-              },
-              update: {
-                title: thread.title,
-                lastScrapedAt: new Date(),
-              },
-            });
+                update: {
+                  title: thread.title,
+                  lastScrapedAt: new Date(),
+                },
+              }),
+              {
+                maxAttempts: 3,
+                onRetry: (attempt, error) => {
+                  console.log(`    DB retry ${attempt}/3: ${error.message}`);
+                },
+              }
+            );
 
         // Determine starting page for resume
         let startFromPage = 1;
         if (resume && dbThread?.lastScrapedPage && dbThread.lastScrapedPage > 0) {
-          // Start from the last scraped page (not +1, in case it was incomplete)
           startFromPage = dbThread.lastScrapedPage;
           console.log(`  Resuming from page ${startFromPage}`);
         }
 
-        // Step 3: Get posts from thread with progress tracking
-        const onProgress = async (progress: ScrapeProgress) => {
-          // Save progress to DB periodically
-          if (!dryRun && dbThread) {
-            await prisma.thread.update({
-              where: { id: dbThread.id },
-              data: {
-                lastScrapedPage: progress.lastScrapedPage,
-                totalPages: progress.totalPages,
-              },
-            });
-          }
-        };
+        // Step 3: Get posts from thread with chunked progress tracking
+        let totalPages = 1;
+        let currentChunkStart = startFromPage;
+        let allPostsProcessed = 0;
+        let allCasesExtracted = 0;
 
+        // First, get total pages
+        const initialResult = await adapter.getPosts(thread, {
+          startFromPage: 1,
+          onProgress: async (progress) => {
+            totalPages = progress.totalPages;
+          },
+        });
+
+        // If we only fetched page 1 to get total, we need to refetch from startFromPage
+        // But our adapter fetches all pages at once, so we use chunked approach differently
+        
+        // For chunked processing, we process the posts in chunks after fetching
         const { posts, progress } = await adapter.getPosts(thread, {
           startFromPage,
-          onProgress,
+          onProgress: async (prog: ScrapeProgress) => {
+            // Save progress every PAGES_PER_CHUNK pages
+            if (!dryRun && dbThread && prog.lastScrapedPage % PAGES_PER_CHUNK === 0) {
+              await retryWithBackoff(
+                () => prisma.thread.update({
+                  where: { id: dbThread.id },
+                  data: {
+                    lastScrapedPage: prog.lastScrapedPage,
+                    totalPages: prog.totalPages,
+                  },
+                }),
+                { maxAttempts: 2 }
+              );
+            }
+            
+            // Check for shutdown
+            if (shouldStop()) {
+              throw new Error('Shutdown requested');
+            }
+          },
         });
-        
+
         stats.postsFound += posts.length;
         console.log(`  Found ${posts.length} posts (pages ${startFromPage}-${progress.lastScrapedPage} of ${progress.totalPages})`);
 
-        // Step 4: Process posts in batches
+        // Step 4: Process posts in chunks
         if (dryRun) {
-          // Dry run: just log what would happen
           for (const post of posts) {
+            if (shouldStop()) break;
             const extraction = extractCaseData(post.content);
             if (extraction.confidence > 0.3) {
               console.log(`    [DRY RUN] Would extract: ${extraction.applicationRoute || 'unknown route'} (${(extraction.confidence * 100).toFixed(0)}%)`);
@@ -127,27 +221,64 @@ export async function runScraper(options: RunScraperOptions): Promise<void> {
             stats.postsScraped++;
           }
         } else if (dbThread) {
-          // Real run: batch insert/update
-          const result = await processPostsInBatches(dbThread.id, posts);
-          stats.postsScraped += result.postsProcessed;
-          stats.casesExtracted += result.casesExtracted;
-          console.log(`  Processed ${result.postsProcessed} posts, extracted ${result.casesExtracted} cases`);
+          // Process in chunks of posts from PAGES_PER_CHUNK pages
+          const postsPerChunk = PAGES_PER_CHUNK * 25; // ~250 posts per chunk
+          
+          for (let chunkStart = 0; chunkStart < posts.length; chunkStart += postsPerChunk) {
+            if (shouldStop()) {
+              console.log('  Shutdown requested, saving progress...');
+              break;
+            }
+
+            const chunk = posts.slice(chunkStart, chunkStart + postsPerChunk);
+            console.log(`  Processing chunk ${Math.floor(chunkStart / postsPerChunk) + 1}/${Math.ceil(posts.length / postsPerChunk)} (${chunk.length} posts)...`);
+            
+            const result = await processPostsInBatches(dbThread.id, chunk);
+            allPostsProcessed += result.postsProcessed;
+            allCasesExtracted += result.casesExtracted;
+            
+            // Update progress after each chunk
+            const lastPageInChunk = Math.max(...chunk.map(p => p.pageNumber || 0));
+            if (lastPageInChunk > 0) {
+              await retryWithBackoff(
+                () => prisma.thread.update({
+                  where: { id: dbThread.id },
+                  data: {
+                    lastScrapedPage: lastPageInChunk,
+                    totalPages: progress.totalPages,
+                  },
+                }),
+                { maxAttempts: 2 }
+              );
+            }
+          }
+          
+          stats.postsScraped += allPostsProcessed;
+          stats.casesExtracted += allCasesExtracted;
+          console.log(`  Processed ${allPostsProcessed} posts, extracted ${allCasesExtracted} cases`);
         }
 
         // Update final progress
-        if (!dryRun && dbThread) {
-          await prisma.thread.update({
-            where: { id: dbThread.id },
-            data: {
-              lastScrapedPage: progress.lastScrapedPage,
-              totalPages: progress.totalPages,
-              lastScrapedAt: new Date(),
-            },
-          });
+        if (!dryRun && dbThread && !shouldStop()) {
+          await retryWithBackoff(
+            () => prisma.thread.update({
+              where: { id: dbThread.id },
+              data: {
+                lastScrapedPage: progress.lastScrapedPage,
+                totalPages: progress.totalPages,
+                lastScrapedAt: new Date(),
+              },
+            }),
+            { maxAttempts: 2 }
+          );
         }
 
         stats.threadsScraped++;
       } catch (error) {
+        if (shouldStop()) {
+          console.log('  Stopped due to shutdown request');
+          break;
+        }
         console.error(`  Error processing thread ${thread.externalId}:`, error);
         // Continue with other threads
       }
@@ -157,18 +288,21 @@ export async function runScraper(options: RunScraperOptions): Promise<void> {
     if (adapter.cleanup) {
       await adapter.cleanup();
     }
+    currentAdapter = null;
 
-    // Update scrape run with success
+    // Update scrape run with success/partial success
     if (scrapeRun) {
       await prisma.scrapeRun.update({
         where: { id: scrapeRun.id },
         data: {
-          status: 'completed',
+          status: shouldStop() ? 'failed' : 'completed',
           completedAt: new Date(),
+          errorMessage: shouldStop() ? 'Stopped by user' : undefined,
           ...stats,
         },
       });
     }
+    currentScrapeRunId = null;
 
     console.log('\nScrape stats:', stats);
   } catch (error) {
@@ -180,6 +314,7 @@ export async function runScraper(options: RunScraperOptions): Promise<void> {
         // Ignore cleanup errors
       }
     }
+    currentAdapter = null;
 
     // Update scrape run with failure
     if (scrapeRun) {
@@ -194,6 +329,8 @@ export async function runScraper(options: RunScraperOptions): Promise<void> {
         },
       });
     }
+    currentScrapeRunId = null;
+    
     throw error;
   }
 }
@@ -214,18 +351,21 @@ async function processPostsInBatches(
     contentHash: hashContent(post.content),
   }));
 
-  // Get existing posts to check for changes
-  const existingPosts = await prisma.post.findMany({
-    where: {
-      threadId,
-      externalId: { in: posts.map((p) => p.externalId) },
-    },
-    select: {
-      id: true,
-      externalId: true,
-      contentHash: true,
-    },
-  });
+  // Get existing posts to check for changes (with retry)
+  const existingPosts = await retryWithBackoff(
+    () => prisma.post.findMany({
+      where: {
+        threadId,
+        externalId: { in: posts.map((p) => p.externalId) },
+      },
+      select: {
+        id: true,
+        externalId: true,
+        contentHash: true,
+      },
+    }),
+    { maxAttempts: 3 }
+  );
 
   const existingPostMap = new Map(
     existingPosts.map((p) => [p.externalId, p])
@@ -247,126 +387,143 @@ async function processPostsInBatches(
 
   console.log(`    New: ${newPosts.length}, Changed: ${changedPosts.length}, Unchanged: ${posts.length - newPosts.length - changedPosts.length}`);
 
-  // Process new posts in batches
+  // Process new posts in batches with retry
   for (let i = 0; i < newPosts.length; i += BATCH_SIZE) {
+    if (shutdownRequested) break;
+    
     const batch = newPosts.slice(i, i + BATCH_SIZE);
     
-    await prisma.$transaction(async (tx) => {
-      // Insert new posts
-      await tx.post.createMany({
-        data: batch.map((post) => ({
-          threadId,
-          externalId: post.externalId,
-          authorName: post.authorName,
-          content: post.content,
-          contentHash: post.contentHash,
-          postedAt: post.postedAt,
-          pageNumber: post.pageNumber,
-        })),
-        skipDuplicates: true,
-      });
-
-      // Get the created posts to extract cases
-      const createdPosts = await tx.post.findMany({
-        where: {
-          threadId,
-          externalId: { in: batch.map((p) => p.externalId) },
-        },
-        select: { id: true, externalId: true, content: true },
-      });
-
-      // Extract cases and prepare for batch insert
-      const casesToCreate: Prisma.ExtractedCaseCreateManyInput[] = [];
-      
-      for (const dbPost of createdPosts) {
-        const originalPost = batch.find((p) => p.externalId === dbPost.externalId);
-        if (!originalPost) continue;
-
-        const extraction = extractCaseData(dbPost.content);
-        if (extraction.confidence > 0.3) {
-          casesToCreate.push({
-            postId: dbPost.id,
-            applicationType: extraction.applicationType,
-            applicationRoute: extraction.applicationRoute,
-            applicationDate: extraction.applicationDate,
-            biometricsDate: extraction.biometricsDate,
-            decisionDate: extraction.decisionDate,
-            waitingDays: extraction.waitingDays,
-            serviceCenter: extraction.serviceCenter,
-            applicantLocation: extraction.applicantLocation,
-            outcome: extraction.outcome,
-            confidence: extraction.confidence,
-            extractionNotes: extraction.extractionNotes,
-          });
-        }
-      }
-
-      if (casesToCreate.length > 0) {
-        await tx.extractedCase.createMany({
-          data: casesToCreate,
+    await retryWithBackoff(
+      () => prisma.$transaction(async (tx) => {
+        // Insert new posts
+        await tx.post.createMany({
+          data: batch.map((post) => ({
+            threadId,
+            externalId: post.externalId,
+            authorName: post.authorName,
+            content: post.content,
+            contentHash: post.contentHash,
+            postedAt: post.postedAt,
+            pageNumber: post.pageNumber,
+          })),
           skipDuplicates: true,
         });
-        casesExtracted += casesToCreate.length;
+
+        // Get the created posts to extract cases
+        const createdPosts = await tx.post.findMany({
+          where: {
+            threadId,
+            externalId: { in: batch.map((p) => p.externalId) },
+          },
+          select: { id: true, externalId: true, content: true },
+        });
+
+        // Extract cases and prepare for batch insert
+        const casesToCreate: Prisma.ExtractedCaseCreateManyInput[] = [];
+        
+        for (const dbPost of createdPosts) {
+          const extraction = extractCaseData(dbPost.content);
+          if (extraction.confidence > 0.3) {
+            casesToCreate.push({
+              postId: dbPost.id,
+              applicationType: extraction.applicationType,
+              applicationRoute: extraction.applicationRoute,
+              applicationDate: extraction.applicationDate,
+              biometricsDate: extraction.biometricsDate,
+              decisionDate: extraction.decisionDate,
+              waitingDays: extraction.waitingDays,
+              serviceCenter: extraction.serviceCenter,
+              applicantLocation: extraction.applicantLocation,
+              outcome: extraction.outcome,
+              confidence: extraction.confidence,
+              extractionNotes: extraction.extractionNotes,
+            });
+          }
+        }
+
+        if (casesToCreate.length > 0) {
+          await tx.extractedCase.createMany({
+            data: casesToCreate,
+            skipDuplicates: true,
+          });
+          casesExtracted += casesToCreate.length;
+        }
+      }),
+      {
+        maxAttempts: 3,
+        onRetry: (attempt, error) => {
+          console.log(`    DB batch retry ${attempt}/3: ${error.message}`);
+        },
       }
-    });
+    );
 
     postsProcessed += batch.length;
   }
 
-  // Process changed posts (updates) - these need individual upserts
+  // Process changed posts (updates) with retry
   for (const post of changedPosts) {
+    if (shutdownRequested) break;
+    
     const existing = existingPostMap.get(post.externalId);
     if (!existing) continue;
 
-    await prisma.$transaction(async (tx) => {
-      // Update post
-      await tx.post.update({
-        where: { id: existing.id },
-        data: {
-          content: post.content,
-          contentHash: post.contentHash,
-          scrapedAt: new Date(),
-          pageNumber: post.pageNumber,
-        },
-      });
-
-      // Re-extract case data
-      const extraction = extractCaseData(post.content);
-      if (extraction.confidence > 0.3) {
-        await tx.extractedCase.upsert({
-          where: { postId: existing.id },
-          create: {
-            postId: existing.id,
-            applicationType: extraction.applicationType,
-            applicationRoute: extraction.applicationRoute,
-            applicationDate: extraction.applicationDate,
-            biometricsDate: extraction.biometricsDate,
-            decisionDate: extraction.decisionDate,
-            waitingDays: extraction.waitingDays,
-            serviceCenter: extraction.serviceCenter,
-            applicantLocation: extraction.applicantLocation,
-            outcome: extraction.outcome,
-            confidence: extraction.confidence,
-            extractionNotes: extraction.extractionNotes,
-          },
-          update: {
-            applicationType: extraction.applicationType,
-            applicationRoute: extraction.applicationRoute,
-            applicationDate: extraction.applicationDate,
-            biometricsDate: extraction.biometricsDate,
-            decisionDate: extraction.decisionDate,
-            waitingDays: extraction.waitingDays,
-            serviceCenter: extraction.serviceCenter,
-            applicantLocation: extraction.applicantLocation,
-            outcome: extraction.outcome,
-            confidence: extraction.confidence,
-            extractionNotes: extraction.extractionNotes,
-            extractedAt: new Date(),
+    await retryWithBackoff(
+      () => prisma.$transaction(async (tx) => {
+        // Update post
+        await tx.post.update({
+          where: { id: existing.id },
+          data: {
+            content: post.content,
+            contentHash: post.contentHash,
+            scrapedAt: new Date(),
+            pageNumber: post.pageNumber,
           },
         });
-        casesExtracted++;
+
+        // Re-extract case data
+        const extraction = extractCaseData(post.content);
+        if (extraction.confidence > 0.3) {
+          await tx.extractedCase.upsert({
+            where: { postId: existing.id },
+            create: {
+              postId: existing.id,
+              applicationType: extraction.applicationType,
+              applicationRoute: extraction.applicationRoute,
+              applicationDate: extraction.applicationDate,
+              biometricsDate: extraction.biometricsDate,
+              decisionDate: extraction.decisionDate,
+              waitingDays: extraction.waitingDays,
+              serviceCenter: extraction.serviceCenter,
+              applicantLocation: extraction.applicantLocation,
+              outcome: extraction.outcome,
+              confidence: extraction.confidence,
+              extractionNotes: extraction.extractionNotes,
+            },
+            update: {
+              applicationType: extraction.applicationType,
+              applicationRoute: extraction.applicationRoute,
+              applicationDate: extraction.applicationDate,
+              biometricsDate: extraction.biometricsDate,
+              decisionDate: extraction.decisionDate,
+              waitingDays: extraction.waitingDays,
+              serviceCenter: extraction.serviceCenter,
+              applicantLocation: extraction.applicantLocation,
+              outcome: extraction.outcome,
+              confidence: extraction.confidence,
+              extractionNotes: extraction.extractionNotes,
+              extractedAt: new Date(),
+            },
+          });
+          casesExtracted++;
+        }
+      }),
+      {
+        maxAttempts: 3,
+        onRetry: (attempt, error) => {
+          console.log(`    DB update retry ${attempt}/3: ${error.message}`);
+        },
       }
-    });
+    );
 
     postsProcessed++;
   }
