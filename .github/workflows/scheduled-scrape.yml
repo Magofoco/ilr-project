@@ -1,0 +1,61 @@
+name: Scheduled Scrape
+
+on:
+  schedule:
+    # Run daily at 6 AM UTC
+    - cron: '0 6 * * *'
+  workflow_dispatch:
+    # Allow manual trigger
+    inputs:
+      source:
+        description: 'Source name to scrape (leave empty for all)'
+        required: false
+        type: string
+
+env:
+  DATABASE_URL: ${{ secrets.DATABASE_URL }}
+  DATABASE_DIRECT_URL: ${{ secrets.DATABASE_DIRECT_URL }}
+  SCRAPE_RATE_LIMIT: 10
+  SCRAPE_JITTER_MIN: 2000
+  SCRAPE_JITTER_MAX: 5000
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 9
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'pnpm'
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Generate Prisma Client
+        run: pnpm db:generate
+
+      - name: Build packages
+        run: pnpm run build
+
+      - name: Install Playwright
+        run: npx playwright install chromium
+        working-directory: apps/worker
+
+      - name: Run Scheduled Scrape
+        if: ${{ !github.event.inputs.source }}
+        run: pnpm worker:run scheduled
+
+      - name: Run Single Source Scrape
+        if: ${{ github.event.inputs.source }}
+        run: pnpm worker:run run --source=${{ github.event.inputs.source }}

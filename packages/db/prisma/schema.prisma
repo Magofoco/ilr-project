@@ -1,0 +1,178 @@
+// Prisma schema for ILR Tracker
+// Uses Supabase Postgres with connection pooling
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider  = "postgresql"
+  url       = env("DATABASE_URL")
+  directUrl = env("DATABASE_DIRECT_URL")
+}
+
+// ============================================
+// FORUM SOURCES
+// ============================================
+
+model SourceForum {
+  id          String   @id @default(cuid())
+  name        String   @unique // e.g., "immigrationboards", "ukvisa-reddit"
+  displayName String   @map("display_name")
+  baseUrl     String   @map("base_url")
+  type        String   // "playwright" | "fetch" - determines scraping strategy
+  config      Json     @default("{}") // source-specific config (selectors, pagination, etc.)
+  isActive    Boolean  @default(true) @map("is_active")
+  createdAt   DateTime @default(now()) @map("created_at")
+  updatedAt   DateTime @updatedAt @map("updated_at")
+
+  threads    Thread[]
+  scrapeRuns ScrapeRun[]
+
+  @@map("source_forums")
+}
+
+// ============================================
+// THREADS & POSTS
+// ============================================
+
+model Thread {
+  id              String   @id @default(cuid())
+  sourceId        String   @map("source_id")
+  externalId      String   @map("external_id") // Forum's own thread ID
+  url             String
+  title           String
+  authorName      String?  @map("author_name")
+  postedAt        DateTime? @map("posted_at")
+  lastScrapedAt   DateTime? @map("last_scraped_at")
+  lastScrapedPage Int?     @map("last_scraped_page") // For resume capability
+  totalPages      Int?     @map("total_pages") // Total pages discovered
+  createdAt       DateTime @default(now()) @map("created_at")
+  updatedAt       DateTime @updatedAt @map("updated_at")
+
+  source SourceForum @relation(fields: [sourceId], references: [id], onDelete: Cascade)
+  posts  Post[]
+
+  @@unique([sourceId, externalId])
+  @@index([sourceId])
+  @@index([postedAt])
+  @@map("threads")
+}
+
+model Post {
+  id           String   @id @default(cuid())
+  threadId     String   @map("thread_id")
+  externalId   String   @map("external_id") // Forum's own post ID (e.g., "p12345")
+  authorName   String?  @map("author_name")
+  content      String   // Raw content (we store relevant text, not entire HTML)
+  contentHash  String   @map("content_hash") // For dedup/change detection
+  postedAt     DateTime? @map("posted_at")
+  scrapedAt    DateTime @default(now()) @map("scraped_at")
+  pageNumber   Int?     @map("page_number") // Which page of the thread this post was on
+  createdAt    DateTime @default(now()) @map("created_at")
+
+  thread        Thread          @relation(fields: [threadId], references: [id], onDelete: Cascade)
+  extractedCase ExtractedCase?
+
+  @@unique([threadId, externalId])
+  @@index([threadId])
+  @@index([contentHash])
+  @@index([pageNumber])
+  @@map("posts")
+}
+
+// ============================================
+// EXTRACTED CASE DATA
+// ============================================
+
+model ExtractedCase {
+  id                String   @id @default(cuid())
+  postId            String   @unique @map("post_id")
+  
+  // ILR-specific fields
+  applicationType   String?  @map("application_type") // e.g., "ILR", "FLR(M)", "Naturalization"
+  applicationRoute  String?  @map("application_route") // e.g., "10-year", "5-year", "spouse"
+  
+  // Timeline data (in days, nullable if not extractable)
+  applicationDate   DateTime? @map("application_date")
+  biometricsDate    DateTime? @map("biometrics_date")
+  decisionDate      DateTime? @map("decision_date")
+  waitingDays       Int?     @map("waiting_days") // Computed: decision - application
+  
+  // Location info
+  serviceCenter     String?  @map("service_center") // e.g., "Sheffield", "Liverpool"
+  applicantLocation String?  @map("applicant_location")
+  
+  // Outcome
+  outcome           String?  // "approved", "rejected", "pending", "unknown"
+  
+  // Extraction metadata
+  confidence        Float    @default(0) // 0-1 score
+  extractionNotes   String?  @map("extraction_notes") // Notes about partial/uncertain extractions
+  extractedAt       DateTime @default(now()) @map("extracted_at")
+  extractorVersion  String   @default("1.0") @map("extractor_version")
+  
+  createdAt         DateTime @default(now()) @map("created_at")
+  updatedAt         DateTime @updatedAt @map("updated_at")
+
+  post Post @relation(fields: [postId], references: [id], onDelete: Cascade)
+
+  @@index([applicationType])
+  @@index([applicationRoute])
+  @@index([applicationDate])
+  @@index([decisionDate])
+  @@index([outcome])
+  @@index([confidence])
+  @@map("extracted_cases")
+}
+
+// ============================================
+// SCRAPE RUNS (Logging)
+// ============================================
+
+model ScrapeRun {
+  id            String   @id @default(cuid())
+  sourceId      String   @map("source_id")
+  status        String   // "running", "completed", "failed"
+  startedAt     DateTime @default(now()) @map("started_at")
+  completedAt   DateTime? @map("completed_at")
+  
+  // Stats
+  threadsFound    Int @default(0) @map("threads_found")
+  threadsScraped  Int @default(0) @map("threads_scraped")
+  postsFound      Int @default(0) @map("posts_found")
+  postsScraped    Int @default(0) @map("posts_scraped")
+  casesExtracted  Int @default(0) @map("cases_extracted")
+  
+  // Error tracking
+  errorMessage  String? @map("error_message")
+  errorDetails  Json?   @map("error_details")
+  
+  // Config used for this run
+  runConfig     Json    @default("{}") @map("run_config")
+
+  source SourceForum @relation(fields: [sourceId], references: [id], onDelete: Cascade)
+
+  @@index([sourceId])
+  @@index([startedAt])
+  @@index([status])
+  @@map("scrape_runs")
+}
+
+// ============================================
+// USER ROLES (for admin access)
+// ============================================
+// Note: Supabase Auth handles user authentication.
+// This table maps Supabase user IDs to roles.
+
+model UserRole {
+  id        String   @id @default(cuid())
+  userId    String   @unique @map("user_id") // Supabase Auth user ID
+  role      String   @default("user") // "user" | "admin"
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  @@index([userId])
+  @@index([role])
+  @@map("user_roles")
+}

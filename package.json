@@ -1,0 +1,26 @@
+{
+  "name": "ilr-tracker",
+  "version": "0.0.1",
+  "private": true,
+  "type": "module",
+  "packageManager": "pnpm@9.15.0",
+  "scripts": {
+    "dev": "turbo run dev",
+    "build": "turbo run build",
+    "lint": "turbo run lint",
+    "type-check": "turbo run type-check",
+    "db:generate": "turbo run db:generate --filter=@ilr/db",
+    "db:migrate": "turbo run db:migrate --filter=@ilr/db",
+    "db:push": "turbo run db:push --filter=@ilr/db",
+    "worker:run": "pnpm --filter @ilr/worker run start",
+    "api:dev": "pnpm --filter @ilr/api run dev",
+    "frontend:dev": "pnpm --filter @ilr/frontend run dev"
+  },
+  "devDependencies": {
+    "turbo": "^2.3.3",
+    "typescript": "^5.7.3"
+  },
+  "engines": {
+    "node": ">=20.0.0"
+  }
+}

@@ -1,0 +1,18 @@
+# Railway deployment configuration
+# This file is used when deploying to Railway
+
+[build]
+builder = "dockerfile"
+dockerfilePath = "Dockerfile"
+
+# API Service
+# Deploy with: railway up --service api
+[deploy.api]
+startCommand = "node apps/api/dist/index.js"
+healthcheckPath = "/health"
+healthcheckTimeout = 30
+
+# Worker Service (for one-off runs or cron)
+# Deploy with: railway up --service worker
+[deploy.worker]
+startCommand = "node apps/worker/dist/index.js scheduled"
