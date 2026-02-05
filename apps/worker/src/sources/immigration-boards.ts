@@ -1,7 +1,11 @@
 import { chromium, type Browser, type Page } from 'playwright';
 import type { SourceForum } from '@ilr/db';
 import type { SourceAdapter, ScrapedThread, ScrapedPost, ScrapeProgress } from '@ilr/shared';
-import { delay, getJitter } from '../utils/helpers.js';
+import { retryWithBackoff, stripHtmlWithQuotes, delay as sharedDelay } from '@ilr/shared';
+import { getJitter } from '../utils/helpers.js';
+
+// Use shared delay
+const delay = sharedDelay;
 
 /**
  * Adapter for immigrationboards.com (phpBB forum)
@@ -134,60 +138,41 @@ export function createImmigrationBoardsAdapter(source: SourceForum): SourceAdapt
   };
 
   /**
-   * Navigate to a specific page of the thread
+   * Navigate to a specific page of the thread with retry logic
    */
   const navigateToPage = async (page: Page, threadUrl: string, pageNum: number, postsPerPage: number): Promise<void> => {
     const start = (pageNum - 1) * postsPerPage;
     const url = start === 0 ? threadUrl : `${threadUrl}&start=${start}`;
     
     console.log(`  Navigating to page ${pageNum}: ${url}`);
-    await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 30000 });
+    
+    await retryWithBackoff(
+      async () => {
+        await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 30000 });
+      },
+      {
+        maxAttempts: 3,
+        initialDelayMs: 2000,
+        onRetry: (attempt, error, nextDelay) => {
+          console.log(`    Retry ${attempt}/3 for page ${pageNum} after ${Math.round(nextDelay / 1000)}s: ${error.message}`);
+        },
+        isRetryable: (error) => {
+          // Retry on timeouts and network errors
+          const message = error.message.toLowerCase();
+          return message.includes('timeout') || 
+                 message.includes('network') || 
+                 message.includes('connection') ||
+                 message.includes('econnreset') ||
+                 message.includes('enotfound');
+        },
+      }
+    );
+    
     await handlePopups(page);
   };
 
-  /**
-   * Remove quoted content from HTML
-   * phpBB uses <blockquote> tags for quotes
-   */
-  const removeQuotedContent = (html: string): string => {
-    // Remove blockquote elements (quoted replies)
-    let cleaned = html.replace(/<blockquote[^>]*>[\s\S]*?<\/blockquote>/gi, '');
-    
-    // Also remove divs with quote classes
-    cleaned = cleaned.replace(/<div[^>]*class="[^"]*quote[^"]*"[^>]*>[\s\S]*?<\/div>/gi, '');
-    
-    // Remove "wrote:" citation lines that might remain
-    cleaned = cleaned.replace(/[^<]+wrote:\s*↑[^<]*/gi, '');
-    
-    return cleaned;
-  };
-
-  /**
-   * Convert HTML to plain text
-   */
-  const htmlToText = (html: string): string => {
-    return html
-      // Remove script and style tags with content
-      .replace(/<script\b[^<]*(?:(?!<\/script>)<[^<]*)*<\/script>/gi, '')
-      .replace(/<style\b[^<]*(?:(?!<\/style>)<[^<]*)*<\/style>/gi, '')
-      // Replace <br> with newlines
-      .replace(/<br\s*\/?>/gi, '\n')
-      // Replace block elements with newlines
-      .replace(/<\/(p|div|li|tr)>/gi, '\n')
-      // Remove all other HTML tags
-      .replace(/<[^>]+>/g, ' ')
-      // Decode common HTML entities
-      .replace(/&nbsp;/g, ' ')
-      .replace(/&amp;/g, '&')
-      .replace(/&lt;/g, '<')
-      .replace(/&gt;/g, '>')
-      .replace(/&quot;/g, '"')
-      .replace(/&#39;/g, "'")
-      // Collapse multiple spaces/newlines
-      .replace(/[ \t]+/g, ' ')
-      .replace(/\n\s*\n/g, '\n')
-      .trim();
-  };
+  // Note: Using stripHtmlWithQuotes from @ilr/shared for quote removal and HTML conversion
+  // This handles nested blockquotes correctly by recursively removing them
 
   /**
    * Parse phpBB date formats
@@ -283,9 +268,8 @@ export function createImmigrationBoardsAdapter(source: SourceForum): SourceAdapt
           const contentEl = postEl.locator('.content, .postbody .content, .post-text').first();
           const rawHtml = await contentEl.innerHTML();
           
-          // Strip quoted content and convert to text
-          const cleanedHtml = removeQuotedContent(rawHtml);
-          content = htmlToText(cleanedHtml);
+          // Strip quoted content and convert to text (uses shared utility)
+          content = stripHtmlWithQuotes(rawHtml);
         } catch {
           // Fallback to textContent
           content = (await postEl.textContent()) || '';

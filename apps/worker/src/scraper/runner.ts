@@ -1,5 +1,5 @@
-import { prisma, type SourceForum } from '@ilr/db';
-import type { SourceAdapter, ScrapedThread, ScrapeProgress } from '@ilr/shared';
+import { prisma, Prisma, type SourceForum } from '@ilr/db';
+import type { SourceAdapter, ScrapedThread, ScrapedPost, ScrapeProgress } from '@ilr/shared';
 import { extractCaseData } from '../extraction/extractor.js';
 import { hashContent, delay, getJitter } from '../utils/helpers.js';
 
@@ -10,6 +10,13 @@ interface RunScraperOptions {
   maxThreads?: number;
   dryRun: boolean;
   resume?: boolean; // Whether to resume from last scraped page
+}
+
+// Batch size for database operations
+const BATCH_SIZE = 50;
+
+interface PostWithHash extends ScrapedPost {
+  contentHash: string;
 }
 
 export async function runScraper(options: RunScraperOptions): Promise<void> {
@@ -108,80 +115,23 @@ export async function runScraper(options: RunScraperOptions): Promise<void> {
         stats.postsFound += posts.length;
         console.log(`  Found ${posts.length} posts (pages ${startFromPage}-${progress.lastScrapedPage} of ${progress.totalPages})`);
 
-        // Step 4: Process each post
-        for (const post of posts) {
-          const contentHash = hashContent(post.content);
-
-          // Check if post already exists with same content
-          if (!dryRun && dbThread) {
-            const existingPost = await prisma.post.findUnique({
-              where: {
-                threadId_externalId: {
-                  threadId: dbThread.id,
-                  externalId: post.externalId,
-                },
-              },
-              select: { contentHash: true },
-            });
-
-            // Skip if content unchanged
-            if (existingPost?.contentHash === contentHash) {
-              continue;
-            }
-          }
-
-          // Save post
-          const dbPost = dryRun
-            ? null
-            : await prisma.post.upsert({
-                where: {
-                  threadId_externalId: {
-                    threadId: dbThread!.id,
-                    externalId: post.externalId,
-                  },
-                },
-                create: {
-                  threadId: dbThread!.id,
-                  externalId: post.externalId,
-                  authorName: post.authorName,
-                  content: post.content,
-                  contentHash,
-                  postedAt: post.postedAt,
-                  pageNumber: post.pageNumber,
-                },
-                update: {
-                  content: post.content,
-                  contentHash,
-                  scrapedAt: new Date(),
-                  pageNumber: post.pageNumber,
-                },
-              });
-
-          stats.postsScraped++;
-
-          // Step 5: Extract case data
-          const extraction = extractCaseData(post.content);
-          
-          if (extraction.confidence > 0.3) {
-            // Only save if we have reasonable confidence
-            if (!dryRun && dbPost) {
-              await prisma.extractedCase.upsert({
-                where: { postId: dbPost.id },
-                create: {
-                  postId: dbPost.id,
-                  ...extraction,
-                },
-                update: {
-                  ...extraction,
-                },
-              });
-              stats.casesExtracted++;
-              console.log(`    Extracted case (confidence: ${(extraction.confidence * 100).toFixed(0)}%): ${extraction.applicationRoute || 'unknown route'}`);
-            } else if (dryRun) {
+        // Step 4: Process posts in batches
+        if (dryRun) {
+          // Dry run: just log what would happen
+          for (const post of posts) {
+            const extraction = extractCaseData(post.content);
+            if (extraction.confidence > 0.3) {
               console.log(`    [DRY RUN] Would extract: ${extraction.applicationRoute || 'unknown route'} (${(extraction.confidence * 100).toFixed(0)}%)`);
               stats.casesExtracted++;
             }
+            stats.postsScraped++;
           }
+        } else if (dbThread) {
+          // Real run: batch insert/update
+          const result = await processPostsInBatches(dbThread.id, posts);
+          stats.postsScraped += result.postsProcessed;
+          stats.casesExtracted += result.casesExtracted;
+          console.log(`  Processed ${result.postsProcessed} posts, extracted ${result.casesExtracted} cases`);
         }
 
         // Update final progress
@@ -246,4 +196,180 @@ export async function runScraper(options: RunScraperOptions): Promise<void> {
     }
     throw error;
   }
+}
+
+/**
+ * Process posts in batches for better performance
+ */
+async function processPostsInBatches(
+  threadId: string,
+  posts: ScrapedPost[]
+): Promise<{ postsProcessed: number; casesExtracted: number }> {
+  let postsProcessed = 0;
+  let casesExtracted = 0;
+
+  // Add content hashes to posts
+  const postsWithHashes: PostWithHash[] = posts.map((post) => ({
+    ...post,
+    contentHash: hashContent(post.content),
+  }));
+
+  // Get existing posts to check for changes
+  const existingPosts = await prisma.post.findMany({
+    where: {
+      threadId,
+      externalId: { in: posts.map((p) => p.externalId) },
+    },
+    select: {
+      id: true,
+      externalId: true,
+      contentHash: true,
+    },
+  });
+
+  const existingPostMap = new Map(
+    existingPosts.map((p) => [p.externalId, p])
+  );
+
+  // Separate posts into new, changed, and unchanged
+  const newPosts: PostWithHash[] = [];
+  const changedPosts: PostWithHash[] = [];
+
+  for (const post of postsWithHashes) {
+    const existing = existingPostMap.get(post.externalId);
+    if (!existing) {
+      newPosts.push(post);
+    } else if (existing.contentHash !== post.contentHash) {
+      changedPosts.push(post);
+    }
+    // Unchanged posts are skipped
+  }
+
+  console.log(`    New: ${newPosts.length}, Changed: ${changedPosts.length}, Unchanged: ${posts.length - newPosts.length - changedPosts.length}`);
+
+  // Process new posts in batches
+  for (let i = 0; i < newPosts.length; i += BATCH_SIZE) {
+    const batch = newPosts.slice(i, i + BATCH_SIZE);
+    
+    await prisma.$transaction(async (tx) => {
+      // Insert new posts
+      await tx.post.createMany({
+        data: batch.map((post) => ({
+          threadId,
+          externalId: post.externalId,
+          authorName: post.authorName,
+          content: post.content,
+          contentHash: post.contentHash,
+          postedAt: post.postedAt,
+          pageNumber: post.pageNumber,
+        })),
+        skipDuplicates: true,
+      });
+
+      // Get the created posts to extract cases
+      const createdPosts = await tx.post.findMany({
+        where: {
+          threadId,
+          externalId: { in: batch.map((p) => p.externalId) },
+        },
+        select: { id: true, externalId: true, content: true },
+      });
+
+      // Extract cases and prepare for batch insert
+      const casesToCreate: Prisma.ExtractedCaseCreateManyInput[] = [];
+      
+      for (const dbPost of createdPosts) {
+        const originalPost = batch.find((p) => p.externalId === dbPost.externalId);
+        if (!originalPost) continue;
+
+        const extraction = extractCaseData(dbPost.content);
+        if (extraction.confidence > 0.3) {
+          casesToCreate.push({
+            postId: dbPost.id,
+            applicationType: extraction.applicationType,
+            applicationRoute: extraction.applicationRoute,
+            applicationDate: extraction.applicationDate,
+            biometricsDate: extraction.biometricsDate,
+            decisionDate: extraction.decisionDate,
+            waitingDays: extraction.waitingDays,
+            serviceCenter: extraction.serviceCenter,
+            applicantLocation: extraction.applicantLocation,
+            outcome: extraction.outcome,
+            confidence: extraction.confidence,
+            extractionNotes: extraction.extractionNotes,
+          });
+        }
+      }
+
+      if (casesToCreate.length > 0) {
+        await tx.extractedCase.createMany({
+          data: casesToCreate,
+          skipDuplicates: true,
+        });
+        casesExtracted += casesToCreate.length;
+      }
+    });
+
+    postsProcessed += batch.length;
+  }
+
+  // Process changed posts (updates) - these need individual upserts
+  for (const post of changedPosts) {
+    const existing = existingPostMap.get(post.externalId);
+    if (!existing) continue;
+
+    await prisma.$transaction(async (tx) => {
+      // Update post
+      await tx.post.update({
+        where: { id: existing.id },
+        data: {
+          content: post.content,
+          contentHash: post.contentHash,
+          scrapedAt: new Date(),
+          pageNumber: post.pageNumber,
+        },
+      });
+
+      // Re-extract case data
+      const extraction = extractCaseData(post.content);
+      if (extraction.confidence > 0.3) {
+        await tx.extractedCase.upsert({
+          where: { postId: existing.id },
+          create: {
+            postId: existing.id,
+            applicationType: extraction.applicationType,
+            applicationRoute: extraction.applicationRoute,
+            applicationDate: extraction.applicationDate,
+            biometricsDate: extraction.biometricsDate,
+            decisionDate: extraction.decisionDate,
+            waitingDays: extraction.waitingDays,
+            serviceCenter: extraction.serviceCenter,
+            applicantLocation: extraction.applicantLocation,
+            outcome: extraction.outcome,
+            confidence: extraction.confidence,
+            extractionNotes: extraction.extractionNotes,
+          },
+          update: {
+            applicationType: extraction.applicationType,
+            applicationRoute: extraction.applicationRoute,
+            applicationDate: extraction.applicationDate,
+            biometricsDate: extraction.biometricsDate,
+            decisionDate: extraction.decisionDate,
+            waitingDays: extraction.waitingDays,
+            serviceCenter: extraction.serviceCenter,
+            applicantLocation: extraction.applicantLocation,
+            outcome: extraction.outcome,
+            confidence: extraction.confidence,
+            extractionNotes: extraction.extractionNotes,
+            extractedAt: new Date(),
+          },
+        });
+        casesExtracted++;
+      }
+    });
+
+    postsProcessed++;
+  }
+
+  return { postsProcessed, casesExtracted };
 }

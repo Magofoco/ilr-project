@@ -1,9 +1,31 @@
 import { Command } from 'commander';
 import { prisma } from '@ilr/db';
-import { runScraper } from './scraper/runner.js';
+import { runScraper, gracefulShutdown } from './scraper/runner.js';
 import { getSourceAdapter } from './sources/index.js';
 
 const program = new Command();
+
+// Graceful shutdown handling
+let isShuttingDown = false;
+
+const handleShutdown = async (signal: string) => {
+  if (isShuttingDown) return;
+  isShuttingDown = true;
+  
+  console.log(`\n${signal} received. Gracefully shutting down...`);
+  
+  try {
+    await gracefulShutdown();
+    console.log('Shutdown complete.');
+    process.exit(0);
+  } catch (error) {
+    console.error('Error during shutdown:', error);
+    process.exit(1);
+  }
+};
+
+process.on('SIGINT', () => handleShutdown('SIGINT'));
+process.on('SIGTERM', () => handleShutdown('SIGTERM'));
 
 program
   .name('ilr-worker')
