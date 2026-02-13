@@ -1,5 +1,6 @@
 import { Routes, Route, Navigate } from 'react-router-dom';
 import { Layout } from './components/layout';
+import { Landing } from './pages/landing';
 import { Dashboard } from './pages/dashboard';
 import { Cases } from './pages/cases';
 import { Login } from './pages/login';
@@ -33,15 +34,32 @@ function ProtectedRoute({ children, adminOnly = false }: { children: React.React
 export function App() {
   return (
     <Routes>
-      {/* Public routes */}
+      {/* Public landing page */}
+      <Route path="/" element={<Landing />} />
+
+      {/* Auth routes */}
       <Route path="/login" element={<Login />} />
       <Route path="/signup" element={<Signup />} />
       <Route path="/auth/callback" element={<AuthCallback />} />
 
-      {/* App routes with layout */}
+      {/* Protected app routes with layout */}
       <Route element={<Layout />}>
-        <Route path="/" element={<Dashboard />} />
-        <Route path="/cases" element={<Cases />} />
+        <Route
+          path="/dashboard"
+          element={
+            <ProtectedRoute>
+              <Dashboard />
+            </ProtectedRoute>
+          }
+        />
+        <Route
+          path="/cases"
+          element={
+            <ProtectedRoute>
+              <Cases />
+            </ProtectedRoute>
+          }
+        />
         <Route
           path="/admin"
           element={

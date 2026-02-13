@@ -35,6 +35,7 @@ COPY packages/db/package.json ./packages/db/
 COPY packages/shared/package.json ./packages/shared/
 COPY apps/api/package.json ./apps/api/
 COPY apps/worker/package.json ./apps/worker/
+COPY apps/frontend/package.json ./apps/frontend/
 
 # Install dependencies
 FROM base AS deps

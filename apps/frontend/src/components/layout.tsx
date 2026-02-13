@@ -5,7 +5,7 @@ import { Button } from './ui/button';
 import { cn } from '@/lib/utils';
 
 const navigation = [
-  { name: 'Dashboard', href: '/', icon: BarChart3 },
+  { name: 'Dashboard', href: '/dashboard', icon: BarChart3 },
   { name: 'Cases', href: '/cases', icon: Table2 },
 ];
 
