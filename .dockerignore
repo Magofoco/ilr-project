@@ -1,0 +1,45 @@
+# Dependencies (will be installed in container)
+node_modules
+**/node_modules
+
+# Build outputs
+dist
+**/dist
+.next
+**/.next
+
+# Git
+.git
+.gitignore
+
+# IDE
+.vscode
+.idea
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+npm-debug.log*
+pnpm-debug.log*
+
+# Test coverage
+coverage
+
+# Environment (secrets - don't include in image)
+.env
+.env.local
+.env.*.local
+
+# Turborepo
+.turbo
+
+# Misc
+README.md
+CONTRIBUTING.md
+*.md
+!packages/*/README.md

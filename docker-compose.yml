@@ -1,0 +1,148 @@
+# Docker Compose for Local Development
+# 
+# Usage:
+#   docker compose up -d        # Start database + auto-init
+#   docker compose down         # Stop services
+#   docker compose logs -f      # View logs
+#   docker compose up -d api    # Also run API in container (optional)
+#
+# The database and Prisma init run automatically.
+# App servers (API, frontend) run natively with `pnpm dev` for hot-reload.
+
+services:
+  # PostgreSQL Database
+  db:
+    image: postgres:16-alpine
+    container_name: ilr-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: ilr_dev
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d ilr_dev"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  # Database Init - Generates Prisma Client and pushes schema
+  # Runs automatically as a dependency when database starts
+  prisma-init:
+    build:
+      context: .
+      dockerfile: Dockerfile.dev
+    container_name: ilr-prisma-init
+    working_dir: /app
+    environment:
+      DATABASE_URL: postgresql://postgres:postgres@db:5432/ilr_dev
+      DATABASE_DIRECT_URL: postgresql://postgres:postgres@db:5432/ilr_dev
+    volumes:
+      - .:/app
+      - /app/node_modules
+    depends_on:
+      db:
+        condition: service_healthy
+    # Override .env file values by setting env vars inline
+    command: >
+      sh -c "
+        export DATABASE_URL=postgresql://postgres:postgres@db:5432/ilr_dev &&
+        export DATABASE_DIRECT_URL=postgresql://postgres:postgres@db:5432/ilr_dev &&
+        cd packages/db && pnpm run db:generate && pnpm run db:push &&
+        echo '✅ Database initialized successfully'
+      "
+
+  # API Server (optional - uncomment to run in container)
+  # Most devs prefer `pnpm dev` for hot-reload, but this is useful for testing
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile.dev
+    container_name: ilr-api
+    working_dir: /app/apps/api
+    restart: unless-stopped
+    environment:
+      DATABASE_URL: postgresql://postgres:postgres@db:5432/ilr_dev
+      DATABASE_DIRECT_URL: postgresql://postgres:postgres@db:5432/ilr_dev
+      PORT: 3001
+      API_HOST: "0.0.0.0"
+      CORS_ORIGINS: "http://localhost:5173"
+    ports:
+      - "3001:3001"
+    volumes:
+      - .:/app
+      - /app/node_modules
+    depends_on:
+      prisma-init:
+        condition: service_completed_successfully
+    command: >
+      sh -c "
+        export DATABASE_URL=postgresql://postgres:postgres@db:5432/ilr_dev &&
+        export DATABASE_DIRECT_URL=postgresql://postgres:postgres@db:5432/ilr_dev &&
+        pnpm --filter @ilr/api dev
+      "
+    profiles: ["api"]
+
+  # Frontend (optional - uncomment to run in container)
+  frontend:
+    build:
+      context: .
+      dockerfile: Dockerfile.dev
+    container_name: ilr-frontend
+    working_dir: /app/apps/frontend
+    restart: unless-stopped
+    environment:
+      VITE_API_BASE_URL: "http://localhost:3001"
+    ports:
+      - "5173:5173"
+    volumes:
+      - .:/app
+      - /app/node_modules
+    depends_on:
+      - api
+    command: pnpm --filter @ilr/frontend dev --host
+    profiles: ["frontend"]
+
+  # Worker/Scraper (run on-demand)
+  worker:
+    build:
+      context: .
+      dockerfile: Dockerfile.dev
+    container_name: ilr-worker
+    working_dir: /app/apps/worker
+    environment:
+      DATABASE_URL: postgresql://postgres:postgres@db:5432/ilr_dev
+      DATABASE_DIRECT_URL: postgresql://postgres:postgres@db:5432/ilr_dev
+    volumes:
+      - .:/app
+      - /app/node_modules
+    depends_on:
+      prisma-init:
+        condition: service_completed_successfully
+    command: >
+      sh -c "
+        export DATABASE_URL=postgresql://postgres:postgres@db:5432/ilr_dev &&
+        export DATABASE_DIRECT_URL=postgresql://postgres:postgres@db:5432/ilr_dev &&
+        pnpm --filter @ilr/worker start run
+      "
+    profiles: ["worker"]
+
+  # pgAdmin for database management (optional)
+  pgadmin:
+    image: dpage/pgadmin4:latest
+    container_name: ilr-pgadmin
+    restart: unless-stopped
+    environment:
+      PGADMIN_DEFAULT_EMAIL: admin@local.dev
+      PGADMIN_DEFAULT_PASSWORD: admin
+    ports:
+      - "5050:80"
+    depends_on:
+      - db
+    profiles: ["tools"]
+
+volumes:
+  postgres_data:

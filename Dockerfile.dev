@@ -1,0 +1,44 @@
+# Development Dockerfile for ILR monorepo
+# Used by docker-compose.yml for local development
+
+FROM node:20-alpine
+
+# Install pnpm
+RUN npm install -g pnpm@9
+
+# Install Playwright dependencies (for worker/scraper)
+RUN apk add --no-cache \
+    chromium \
+    nss \
+    freetype \
+    harfbuzz \
+    ca-certificates \
+    ttf-freefont
+
+# Set Playwright to use system Chromium
+ENV PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1
+ENV PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH=/usr/bin/chromium-browser
+
+WORKDIR /app
+
+# Copy workspace configuration
+COPY package.json pnpm-lock.yaml pnpm-workspace.yaml turbo.json ./
+
+# Copy all package.json files for dependency installation
+COPY packages/db/package.json ./packages/db/package.json
+COPY packages/shared/package.json ./packages/shared/package.json
+COPY apps/api/package.json ./apps/api/package.json
+COPY apps/frontend/package.json ./apps/frontend/package.json
+COPY apps/worker/package.json ./apps/worker/package.json
+
+# Install dependencies
+RUN pnpm install
+
+# Copy Prisma schema (needed for generate)
+COPY packages/db/prisma ./packages/db/prisma
+
+# Generate Prisma client
+RUN cd packages/db && pnpm run db:generate
+
+# Copy rest of source (will be overridden by volume mounts in dev)
+COPY . .
