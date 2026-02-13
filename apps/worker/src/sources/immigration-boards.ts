@@ -372,29 +372,22 @@ export function createImmigrationBoardsAdapter(source: SourceForum): SourceAdapt
       let currentPage = startFromPage;
 
       try {
-        // First, navigate to get total pages
-        await navigateToPage(page, thread.url, 1, config.postsPerPage);
+        // Navigate to starting page (or page 1 if fresh start)
+        // We can get totalPages from the pagination on any page
+        await navigateToPage(page, thread.url, startFromPage, config.postsPerPage);
         await page.waitForSelector('.post, div[id^="p"]', { timeout: 15000 });
         
         totalPages = await getTotalPages(page);
-        console.log(`  Thread has ${totalPages} pages total`);
-        
-        // If starting from a specific page, navigate there
-        if (startFromPage > 1) {
-          console.log(`  Resuming from page ${startFromPage}`);
-          await navigateToPage(page, thread.url, startFromPage, config.postsPerPage);
-        }
+        console.log(`  Thread has ${totalPages} pages total, starting from page ${startFromPage}`);
         
         // Scrape pages from startFromPage to end
-        // We scrape newest first (last page first) to get latest updates
-        // But for initial scrape, go forward to support resume
         for (currentPage = startFromPage; currentPage <= totalPages; currentPage++) {
+          // We already navigated to startFromPage above, so only navigate for subsequent pages
           if (currentPage > startFromPage) {
             await navigateToPage(page, thread.url, currentPage, config.postsPerPage);
+            // Wait for posts to load
+            await page.waitForSelector('.post, div[id^="p"]', { timeout: 15000 });
           }
-          
-          // Wait for posts to load
-          await page.waitForSelector('.post, div[id^="p"]', { timeout: 15000 });
           
           // Extract posts from this page
           const pagePosts = await extractPostsFromPage(page, currentPage);
