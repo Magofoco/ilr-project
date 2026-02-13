@@ -94,8 +94,13 @@ services:
     container_name: ilr-frontend
     working_dir: /app/apps/frontend
     restart: unless-stopped
+    env_file:
+      - .env
     environment:
       VITE_API_BASE_URL: "http://localhost:3002"
+      # These will be read from .env file:
+      # VITE_SUPABASE_URL
+      # VITE_SUPABASE_ANON_KEY
     ports:
       - "5172:5173"
     volumes:
