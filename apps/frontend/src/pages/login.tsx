@@ -25,7 +25,7 @@ export function Login() {
       if (error) {
         setError(error.message);
       } else {
-        navigate('/');
+        navigate('/dashboard');
       }
     } catch (err) {
       setError('An unexpected error occurred');
@@ -89,7 +89,7 @@ export function Login() {
 
           <div className="mt-4 text-center">
             <Link to="/" className="text-sm text-muted-foreground hover:underline">
-              Continue without signing in
+              Back to home
             </Link>
           </div>
         </CardContent>

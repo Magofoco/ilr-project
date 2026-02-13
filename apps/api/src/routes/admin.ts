@@ -3,8 +3,8 @@ import { prisma, Prisma } from '@ilr/db';
 import { createSourceForumSchema, updateSourceForumSchema, triggerScrapeSchema } from '@ilr/shared';
 
 export async function adminRoutes(fastify: FastifyInstance) {
-  // All admin routes require authentication + admin role
-  fastify.addHook('preHandler', fastify.requireAdmin);
+  // Auth (JWT + admin role) is handled by the admin scope in index.ts.
+  // All routes here automatically require a valid JWT + admin role.
 
   // List all sources
   fastify.get('/sources', async () => {

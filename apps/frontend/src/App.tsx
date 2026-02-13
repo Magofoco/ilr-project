@@ -9,7 +9,39 @@ import { AuthCallback } from './pages/auth-callback';
 import { Admin } from './pages/admin';
 import { useAuth } from './lib/auth-context';
 
-function ProtectedRoute({ children, adminOnly = false }: { children: React.ReactNode; adminOnly?: boolean }) {
+// ============================================
+// AUTH WRAPPERS (layout-level, not per-route)
+// ============================================
+
+/**
+ * Layout route that requires authentication.
+ * All child routes are automatically protected.
+ * To add a new protected page, just add a <Route> child — no wrapper needed.
+ */
+function ProtectedLayout() {
+  const { user, loading } = useAuth();
+
+  if (loading) {
+    return (
+      <div className="flex items-center justify-center min-h-screen">
+        <div className="animate-spin rounded-full h-8 w-8 border-b-2 border-primary"></div>
+      </div>
+    );
+  }
+
+  if (!user) {
+    return <Navigate to="/login" replace />;
+  }
+
+  return <Layout />;
+}
+
+/**
+ * Layout route that requires admin role.
+ * Inherits auth check from ProtectedLayout pattern,
+ * then additionally checks isAdmin.
+ */
+function AdminLayout() {
   const { user, loading, isAdmin } = useAuth();
 
   if (loading) {
@@ -24,50 +56,65 @@ function ProtectedRoute({ children, adminOnly = false }: { children: React.React
     return <Navigate to="/login" replace />;
   }
 
-  if (adminOnly && !isAdmin) {
-    return <Navigate to="/" replace />;
+  if (!isAdmin) {
+    return <Navigate to="/dashboard" replace />;
+  }
+
+  // Render children inside the shared Layout
+  return <Layout />;
+}
+
+/**
+ * Redirect authenticated users away from auth pages to /dashboard.
+ */
+function GuestRoute({ children }: { children: React.ReactNode }) {
+  const { user, loading } = useAuth();
+
+  if (loading) {
+    return (
+      <div className="flex items-center justify-center min-h-screen">
+        <div className="animate-spin rounded-full h-8 w-8 border-b-2 border-primary"></div>
+      </div>
+    );
+  }
+
+  if (user) {
+    return <Navigate to="/dashboard" replace />;
   }
 
   return <>{children}</>;
 }
 
+// ============================================
+// ROUTES
+// ============================================
+
 export function App() {
   return (
     <Routes>
-      {/* Public landing page */}
+      {/* Public */}
       <Route path="/" element={<Landing />} />
 
-      {/* Auth routes */}
-      <Route path="/login" element={<Login />} />
-      <Route path="/signup" element={<Signup />} />
+      {/* Guest-only (redirect to dashboard if logged in) */}
+      <Route path="/login" element={<GuestRoute><Login /></GuestRoute>} />
+      <Route path="/signup" element={<GuestRoute><Signup /></GuestRoute>} />
       <Route path="/auth/callback" element={<AuthCallback />} />
 
-      {/* Protected app routes with layout */}
-      <Route element={<Layout />}>
-        <Route
-          path="/dashboard"
-          element={
-            <ProtectedRoute>
-              <Dashboard />
-            </ProtectedRoute>
-          }
-        />
-        <Route
-          path="/cases"
-          element={
-            <ProtectedRoute>
-              <Cases />
-            </ProtectedRoute>
-          }
-        />
-        <Route
-          path="/admin"
-          element={
-            <ProtectedRoute adminOnly>
-              <Admin />
-            </ProtectedRoute>
-          }
-        />
+      {/*
+        Protected routes — requires valid Supabase session.
+        To add a new page: just add a <Route> here. That's it.
+      */}
+      <Route element={<ProtectedLayout />}>
+        <Route path="/dashboard" element={<Dashboard />} />
+        <Route path="/cases" element={<Cases />} />
+      </Route>
+
+      {/*
+        Admin routes — requires Supabase session + admin role.
+        To add a new admin page: just add a <Route> here.
+      */}
+      <Route element={<AdminLayout />}>
+        <Route path="/admin" element={<Admin />} />
       </Route>
 
       {/* Catch all */}

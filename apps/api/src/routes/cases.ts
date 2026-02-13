@@ -3,7 +3,10 @@ import { prisma, Prisma } from '@ilr/db';
 import { casesQuerySchema, type CaseWithSource, type PaginatedResponse } from '@ilr/shared';
 
 export async function casesRoutes(fastify: FastifyInstance) {
-  // List cases with filters (public)
+  // Auth is handled by the authenticated scope in index.ts.
+  // All routes here automatically require a valid JWT.
+
+  // List cases with filters
   fastify.get('/', async (request): Promise<PaginatedResponse<CaseWithSource>> => {
     const query = casesQuerySchema.parse(request.query);
 

@@ -46,19 +46,19 @@ export function Admin() {
   // Fetch sources
   const { data: sources, isLoading: loadingSources } = useQuery({
     queryKey: ['admin', 'sources'],
-    queryFn: () => api.get<SourceWithCounts[]>('/admin/sources', { authenticated: true }),
+    queryFn: () => api.get<SourceWithCounts[]>('/admin/sources'),
   });
 
   // Fetch recent scrape runs
   const { data: scrapeRuns, isLoading: loadingRuns } = useQuery({
     queryKey: ['admin', 'scrapeRuns'],
-    queryFn: () => api.get<ScrapeRunWithSource[]>('/admin/scrape/runs', { authenticated: true }),
+    queryFn: () => api.get<ScrapeRunWithSource[]>('/admin/scrape/runs'),
   });
 
   // Create source mutation
   const createSource = useMutation({
     mutationFn: (data: typeof newSource) =>
-      api.post('/admin/sources', data, { authenticated: true }),
+      api.post('/admin/sources', data),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['admin', 'sources'] });
       setShowAddForm(false);
@@ -69,7 +69,7 @@ export function Admin() {
   // Trigger scrape mutation
   const triggerScrape = useMutation({
     mutationFn: (sourceId: string) =>
-      api.post('/admin/scrape/trigger', { sourceId }, { authenticated: true }),
+      api.post('/admin/scrape/trigger', { sourceId }),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['admin', 'scrapeRuns'] });
     },

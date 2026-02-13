@@ -2,22 +2,42 @@ import { supabase } from './supabase';
 
 const API_BASE_URL = import.meta.env.VITE_API_BASE_URL as string || 'http://localhost:3001';
 
+/**
+ * Custom error class for API responses.
+ * Carries the HTTP status code so callers can distinguish
+ * 401 (expired token) from other errors.
+ */
+export class ApiError extends Error {
+  constructor(
+    message: string,
+    public readonly status: number,
+  ) {
+    super(message);
+    this.name = 'ApiError';
+  }
+}
+
 interface RequestOptions extends RequestInit {
-  authenticated?: boolean;
+  /**
+   * Set to true to skip sending the auth token.
+   * By default, all requests include the Supabase JWT.
+   */
+  public?: boolean;
 }
 
 async function request<T>(endpoint: string, options: RequestOptions = {}): Promise<T> {
-  const { authenticated = false, headers: customHeaders, ...rest } = options;
-  
-  const headers: HeadersInit = {
+  const { public: isPublic = false, headers: customHeaders, ...rest } = options;
+
+  const headers: Record<string, string> = {
     'Content-Type': 'application/json',
-    ...customHeaders,
+    ...(customHeaders as Record<string, string>),
   };
 
-  if (authenticated) {
+  // Attach auth token by default — opt out with { public: true }
+  if (!isPublic) {
     const { data: { session } } = await supabase.auth.getSession();
     if (session?.access_token) {
-      (headers as Record<string, string>)['Authorization'] = `Bearer ${session.access_token}`;
+      headers['Authorization'] = `Bearer ${session.access_token}`;
     }
   }
 
@@ -27,8 +47,21 @@ async function request<T>(endpoint: string, options: RequestOptions = {}): Promi
   });
 
   if (!response.ok) {
-    const error = await response.json().catch(() => ({ message: 'Request failed' }));
-    throw new Error(error.message || `HTTP ${response.status}`);
+    const body = await response.json().catch(() => ({ message: 'Request failed' }));
+    const message = body.message || `HTTP ${response.status}`;
+
+    // 401 = token expired or invalid → sign out and redirect to login
+    if (response.status === 401 && !isPublic) {
+      await supabase.auth.signOut();
+      window.location.href = '/login';
+    }
+
+    throw new ApiError(message, response.status);
+  }
+
+  // Handle 204 No Content (e.g. DELETE responses)
+  if (response.status === 204) {
+    return undefined as T;
   }
 
   return response.json();

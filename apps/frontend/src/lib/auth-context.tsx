@@ -46,13 +46,12 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     return () => subscription.unsubscribe();
   }, []);
 
-  async function checkAdminStatus(session: Session) {
+  async function checkAdminStatus(_session: Session) {
     try {
-      // Try to access an admin endpoint to verify role
-      // If this succeeds, the user is an admin
-      await api.get('/admin/sources', {
-        authenticated: true,
-      });
+      // Try to access an admin endpoint to verify role.
+      // Token is sent automatically by the api client.
+      // If this succeeds, the user is an admin.
+      await api.get('/admin/sources');
       setIsAdmin(true);
     } catch {
       setIsAdmin(false);

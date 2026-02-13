@@ -14,7 +14,7 @@ export function AuthCallback() {
         console.error('Auth callback error:', error);
         navigate('/login?error=auth_failed');
       } else {
-        navigate('/');
+        navigate('/dashboard');
       }
     };
 

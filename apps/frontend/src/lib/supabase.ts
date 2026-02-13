@@ -7,12 +7,15 @@ const supabaseAnonKey = import.meta.env.VITE_SUPABASE_ANON_KEY as string;
 export const isSupabaseConfigured = Boolean(supabaseUrl && supabaseAnonKey);
 
 // Create a mock client for local dev without Supabase
+// All auth methods return errors — routes stay protected, nothing crashes
 const createMockClient = () => ({
   auth: {
     getSession: async () => ({ data: { session: null }, error: null }),
     getUser: async () => ({ data: { user: null }, error: null }),
     onAuthStateChange: () => ({ data: { subscription: { unsubscribe: () => {} } } }),
-    signInWithOAuth: async () => ({ data: null, error: new Error('Supabase not configured') }),
+    signInWithPassword: async () => ({ data: { user: null, session: null }, error: new Error('Supabase not configured. Set VITE_SUPABASE_URL and VITE_SUPABASE_ANON_KEY.') }),
+    signInWithOAuth: async () => ({ data: { provider: '', url: '' }, error: new Error('Supabase not configured. Set VITE_SUPABASE_URL and VITE_SUPABASE_ANON_KEY.') }),
+    signUp: async () => ({ data: { user: null, session: null }, error: new Error('Supabase not configured. Set VITE_SUPABASE_URL and VITE_SUPABASE_ANON_KEY.') }),
     signOut: async () => ({ error: null }),
   },
 }) as unknown as SupabaseClient;

@@ -3,7 +3,10 @@ import { prisma, Prisma } from '@ilr/db';
 import type { OverviewStats } from '@ilr/shared';
 
 export async function statsRoutes(fastify: FastifyInstance) {
-  // Public overview stats
+  // Auth is handled by the authenticated scope in index.ts.
+  // All routes here automatically require a valid JWT.
+
+  // Overview stats
   fastify.get('/overview', async (): Promise<OverviewStats> => {
     // Get total cases with valid waiting days
     const totalCases = await prisma.extractedCase.count({
