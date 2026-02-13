@@ -69,9 +69,9 @@ services:
       DATABASE_DIRECT_URL: postgresql://postgres:postgres@db:5432/ilr_dev
       PORT: 3001
       API_HOST: "0.0.0.0"
-      CORS_ORIGINS: "http://localhost:5173"
+      CORS_ORIGINS: "http://localhost:5172"
     ports:
-      - "3001:3001"
+      - "3002:3001"
     volumes:
       - .:/app
       - /app/node_modules
@@ -95,9 +95,9 @@ services:
     working_dir: /app/apps/frontend
     restart: unless-stopped
     environment:
-      VITE_API_BASE_URL: "http://localhost:3001"
+      VITE_API_BASE_URL: "http://localhost:3002"
     ports:
-      - "5173:5173"
+      - "5172:5173"
     volumes:
       - .:/app
       - /app/node_modules
