@@ -2,9 +2,9 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    branches: [master]
   pull_request:
-    branches: [main]
+    branches: [master]
 
 jobs:
   build:
@@ -48,7 +48,6 @@ jobs:
 
       - name: Setup pnpm
         uses: pnpm/action-setup@v4
-        # Version is read from package.json "packageManager" field
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
@@ -58,6 +57,12 @@ jobs:
 
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
+
+      - name: Generate Prisma Client
+        run: pnpm db:generate
+        env:
+          DATABASE_URL: "postgresql://fake:fake@localhost:5432/fake"
+          DATABASE_DIRECT_URL: "postgresql://fake:fake@localhost:5432/fake"
 
       - name: Lint
         run: pnpm lint

@@ -1,11 +1,32 @@
-import { chromium, type Browser, type Page } from 'playwright';
+import { chromium, type Browser, type BrowserContext, type Page } from 'playwright';
 import type { SourceForum } from '@ilr/db';
-import type { SourceAdapter, ScrapedThread, ScrapedPost, ScrapeProgress } from '@ilr/shared';
+import type { SourceAdapter, ScrapedThread, ScrapedPost, ScrapeProgress, GetPostsResult } from '@ilr/shared';
 import { retryWithBackoff, stripHtmlWithQuotes, delay as sharedDelay } from '@ilr/shared';
 import { getJitter } from '../utils/helpers.js';
 
 // Use shared delay
 const delay = sharedDelay;
+
+// Fast timeout for element queries (2 seconds instead of default 30s)
+const FAST_TIMEOUT = 2_000;
+
+// Maximum time to spend on a single page (navigation + extraction)
+const PAGE_TIMEOUT_MS = 45_000; // 45 seconds (extraction is fast via page.evaluate)
+
+// Maximum consecutive page failures before aborting the thread
+const MAX_CONSECUTIVE_FAILURES = 5;
+
+/**
+ * Strip session IDs from URLs to avoid stale/expired session parameters.
+ * phpBB appends &sid=xxx or ?sid=xxx which expire and can cause redirects.
+ */
+function stripSessionId(url: string): string {
+  return url
+    .replace(/[?&]sid=[a-f0-9]+/gi, '')
+    .replace(/\?&/, '?')     // Fix ?& left after stripping
+    .replace(/&&+/g, '&')    // Fix double &&
+    .replace(/[?&]$/, '');   // Fix trailing ? or &
+}
 
 /**
  * Adapter for immigrationboards.com (phpBB forum)
@@ -17,91 +38,214 @@ const delay = sharedDelay;
  * - Extracts actual phpBB post IDs for stable deduplication
  * - Strips quoted content to avoid extracting old data
  * - Supports resume from a specific page
- * - Handles cookie consent and popups
+ * - Handles cookie consent and popups (with state tracking)
+ * - Browser crash recovery with automatic relaunch
+ * - Per-page timeout to prevent hangs
+ * - Progress logging with ETA
  */
 export function createImmigrationBoardsAdapter(source: SourceForum): SourceAdapter {
   let browser: Browser | null = null;
+
+  // Track which popups we've already dismissed in this session.
+  // Once a popup is dismissed (and cookies saved), it typically won't reappear.
+  const popupState = {
+    consent: false,
+    notifications: false,
+    login: false,
+    doNotShow: false,
+  };
 
   const getConfig = () => {
     const config = source.config as {
       threadUrl?: string;
       postsPerPage?: number;
     };
+
+    const rawUrl = config.threadUrl || 'https://www.immigrationboards.com/viewtopic.php?t=231555';
     
     return {
-      // The specific ILR timelines thread
-      threadUrl: config.threadUrl || 'https://www.immigrationboards.com/viewtopic.php?t=231555',
+      threadUrl: stripSessionId(rawUrl),
       postsPerPage: config.postsPerPage || 25,
     };
   };
 
   const initBrowser = async (): Promise<Browser> => {
-    if (!browser) {
-      browser = await chromium.launch({
-        headless: true,
-        args: [
-          '--no-sandbox',
-          '--disable-setuid-sandbox',
-          '--disable-dev-shm-usage',
-          '--disable-accelerated-2d-canvas',
-          '--disable-gpu',
-        ],
-      });
+    if (browser?.isConnected()) {
+      return browser;
     }
+    
+    // Close stale browser reference if disconnected
+    if (browser) {
+      try { await browser.close(); } catch { /* already dead */ }
+      browser = null;
+    }
+
+    console.log('  Launching browser...');
+    browser = await chromium.launch({
+      headless: process.env.HEADLESS !== 'false',
+      args: [
+        '--no-sandbox',
+        '--disable-setuid-sandbox',
+        '--disable-dev-shm-usage',
+        '--disable-accelerated-2d-canvas',
+        '--disable-gpu',
+        '--single-process',
+      ],
+    });
+
+    // Auto-cleanup on unexpected disconnect
+    browser.on('disconnected', () => {
+      console.warn('  Browser disconnected unexpectedly');
+      browser = null;
+    });
+
     return browser;
+  };
+
+  /**
+   * Create a browser context with consistent settings.
+   * Keeping the context alive across pages preserves cookies (popup dismissals).
+   */
+  const createContext = async (browserInstance: Browser): Promise<BrowserContext> => {
+    return browserInstance.newContext({
+      userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+      viewport: { width: 1280, height: 800 },
+      locale: 'en-GB',
+      timezoneId: 'Europe/London',
+    });
   };
 
   const closeBrowser = async (): Promise<void> => {
     if (browser) {
-      await browser.close();
+      try {
+        await browser.close();
+      } catch {
+        // Already closed
+      }
       browser = null;
     }
   };
 
   /**
-   * Handle cookie consent and other popups
+   * Handle cookie consent and other popups.
+   * Tracks state so we skip popups already dismissed in this session.
    */
   const handlePopups = async (page: Page): Promise<void> => {
-    try {
-      // Cookie consent buttons (various phpBB themes)
-      const consentSelectors = [
-        'button[aria-label="Consent"]',
-        '.cc-btn.cc-allow',
-        '#cookie-accept',
-        'button:has-text("Accept")',
-        'button:has-text("I agree")',
-        '.cookie-consent-accept',
-      ];
+    // If all popups already dismissed, skip entirely
+    if (popupState.consent && popupState.notifications && popupState.login && popupState.doNotShow) {
+      return;
+    }
 
-      for (const selector of consentSelectors) {
-        try {
-          const button = page.locator(selector).first();
-          if (await button.isVisible({ timeout: 1000 })) {
-            await button.click();
-            await delay(500);
-            break;
+    try {
+      // Brief wait for CMP to load (only on first page or if consent not yet handled)
+      if (!popupState.consent) {
+        await delay(2000);
+      } else {
+        await delay(500); // Shorter wait for subsequent popups
+      }
+
+      // 1. Google Funding Choices CMP (iframe-based consent)
+      if (!popupState.consent) {
+        let dismissed = false;
+        for (const frame of page.frames()) {
+          try {
+            const consentBtn = frame.locator('button.fc-cta-consent').first();
+            if (await consentBtn.isVisible({ timeout: 1500 })) {
+              console.log('  Dismissing Funding Choices consent popup...');
+              await consentBtn.click();
+              await delay(1000);
+              popupState.consent = true;
+              dismissed = true;
+              break;
+            }
+          } catch {
+            // Not in this frame
           }
-        } catch {
-          // Selector not found, continue
+        }
+
+        // Fallback: other CMP implementations
+        if (!dismissed) {
+          const consentSelectors = [
+            'button[aria-label="Consent"]',
+            'button:has-text("Consent")',
+            '.cc-btn.cc-allow',
+            '#cookie-accept',
+            'button:has-text("Accept")',
+            'button:has-text("I agree")',
+            '.cookie-consent-accept',
+          ];
+
+          for (const selector of consentSelectors) {
+            try {
+              const button = page.locator(selector).first();
+              if (await button.isVisible({ timeout: 500 })) {
+                console.log(`  Dismissing consent popup (${selector})...`);
+                await button.click();
+                await delay(500);
+                popupState.consent = true;
+                break;
+              }
+            } catch {
+              // Selector not found, continue
+            }
+          }
+        }
+
+        // If we checked all selectors and none visible, assume no consent needed
+        if (!dismissed) {
+          popupState.consent = true;
         }
       }
 
-      // "Do not show this again" checkbox
-      try {
-        const doNotShow = page.locator('input[name="popup_no_show"]');
-        if (await doNotShow.isVisible({ timeout: 500 })) {
-          await doNotShow.check();
-          const submitBtn = page.locator('input[type="submit"][value="OK"]');
-          if (await submitBtn.isVisible({ timeout: 500 })) {
-            await submitBtn.click();
+      // 2. Dismiss "allow notifications" overlay
+      if (!popupState.notifications) {
+        try {
+          const closeBtn = page.locator('#close, div#close').first();
+          if (await closeBtn.isVisible({ timeout: 1000 })) {
+            console.log('  Dismissing notifications popup...');
+            await closeBtn.click();
             await delay(500);
           }
+          popupState.notifications = true;
+        } catch {
+          popupState.notifications = true; // Don't check again
         }
-      } catch {
-        // No popup
+      }
+
+      // 3. Dismiss login popup (click "Do not show")
+      if (!popupState.login) {
+        try {
+          const loginClose = page.locator('#login_popup_close').first();
+          if (await loginClose.isVisible({ timeout: 1000 })) {
+            console.log('  Dismissing login popup...');
+            await loginClose.click();
+            await delay(500);
+          }
+          popupState.login = true;
+        } catch {
+          popupState.login = true; // Don't check again
+        }
+      }
+
+      // 4. "Do not show this again" checkbox (phpBB-specific)
+      if (!popupState.doNotShow) {
+        try {
+          const doNotShow = page.locator('input[name="popup_no_show"]');
+          if (await doNotShow.isVisible({ timeout: 500 })) {
+            await doNotShow.check();
+            const submitBtn = page.locator('input[type="submit"][value="OK"]');
+            if (await submitBtn.isVisible({ timeout: 500 })) {
+              await submitBtn.click();
+              await delay(500);
+            }
+          }
+          popupState.doNotShow = true;
+        } catch {
+          popupState.doNotShow = true;
+        }
       }
     } catch (error) {
-      console.log('  Note: Error handling popups (non-fatal):', error);
+      console.log('  Note: Error handling popups (non-fatal):', (error as Error).message);
     }
   };
 
@@ -110,45 +254,72 @@ export function createImmigrationBoardsAdapter(source: SourceForum): SourceAdapt
    */
   const getTotalPages = async (page: Page): Promise<number> => {
     try {
-      // phpBB pagination: look for the last page number
-      // Common patterns: "Page 1 of 161" or pagination links like "161"
-      
-      // Try "Page X of Y" text
-      const pageText = await page.locator('.pagination').textContent();
-      if (pageText) {
-        const match = pageText.match(/of\s+(\d+)/i);
-        if (match && match[1]) {
-          return parseInt(match[1], 10);
+      // Method 1: phpBB sr-only span "Page X of Y"
+      try {
+        const srOnly = await page.locator('.pagination .sr-only').first().textContent({ timeout: FAST_TIMEOUT });
+        if (srOnly) {
+          const match = srOnly.match(/of\s+(\d+)/i);
+          if (match && match[1]) {
+            return parseInt(match[1], 10);
+          }
         }
+      } catch {
+        // No sr-only element
       }
 
-      // Try finding the highest page number in pagination links
-      const pageLinks = await page.locator('.pagination a, .pagination li').allTextContents();
-      let maxPage = 1;
-      for (const text of pageLinks) {
-        const num = parseInt(text.trim(), 10);
-        if (!isNaN(num) && num > maxPage) {
-          maxPage = num;
+      // Method 2: Find the last numbered page link in pagination
+      try {
+        const pageLinks = await page.locator('.pagination li a.button').allTextContents();
+        let maxPage = 1;
+        for (const text of pageLinks) {
+          const num = parseInt(text.trim(), 10);
+          if (!isNaN(num) && num > maxPage) {
+            maxPage = num;
+          }
         }
+        if (maxPage > 1) return maxPage;
+      } catch {
+        // No pagination links
       }
-      return maxPage;
+
+      // Method 3: Full pagination text fallback
+      try {
+        const pageText = await page.locator('.pagination').textContent({ timeout: FAST_TIMEOUT });
+        if (pageText) {
+          const match = pageText.match(/of\s+(\d+)/i);
+          if (match && match[1]) {
+            return parseInt(match[1], 10);
+          }
+        }
+      } catch {
+        // No pagination
+      }
+
+      return 1;
     } catch {
       return 1;
     }
   };
 
   /**
+   * Build a clean pagination URL for the given page number.
+   * Strips session IDs and constructs the URL deterministically.
+   */
+  const buildPageUrl = (threadUrl: string, pageNum: number, postsPerPage: number): string => {
+    const cleanUrl = stripSessionId(threadUrl);
+    const start = (pageNum - 1) * postsPerPage;
+    return start === 0 ? cleanUrl : `${cleanUrl}&start=${start}`;
+  };
+
+  /**
    * Navigate to a specific page of the thread with retry logic
    */
   const navigateToPage = async (page: Page, threadUrl: string, pageNum: number, postsPerPage: number): Promise<void> => {
-    const start = (pageNum - 1) * postsPerPage;
-    const url = start === 0 ? threadUrl : `${threadUrl}&start=${start}`;
-    
-    console.log(`  Navigating to page ${pageNum}: ${url}`);
+    const url = buildPageUrl(threadUrl, pageNum, postsPerPage);
     
     await retryWithBackoff(
       async () => {
-        await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 30000 });
+        await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 30_000 });
       },
       {
         maxAttempts: 3,
@@ -157,22 +328,21 @@ export function createImmigrationBoardsAdapter(source: SourceForum): SourceAdapt
           console.log(`    Retry ${attempt}/3 for page ${pageNum} after ${Math.round(nextDelay / 1000)}s: ${error.message}`);
         },
         isRetryable: (error) => {
-          // Retry on timeouts and network errors
           const message = error.message.toLowerCase();
           return message.includes('timeout') || 
                  message.includes('network') || 
                  message.includes('connection') ||
                  message.includes('econnreset') ||
-                 message.includes('enotfound');
+                 message.includes('enotfound') ||
+                 message.includes('econnrefused') ||
+                 message.includes('err_') ||
+                 message.includes('target closed');
         },
       }
     );
     
     await handlePopups(page);
   };
-
-  // Note: Using stripHtmlWithQuotes from @ilr/shared for quote removal and HTML conversion
-  // This handles nested blockquotes correctly by recursively removing them
 
   /**
    * Parse phpBB date formats
@@ -217,125 +387,147 @@ export function createImmigrationBoardsAdapter(source: SourceForum): SourceAdapt
   };
 
   /**
-   * Extract posts from the current page
+   * Extract all posts from the current page in a single page.evaluate() call.
+   * This is dramatically faster than per-element Playwright locators because
+   * it runs as a single IPC round-trip to the browser instead of hundreds.
    */
   const extractPostsFromPage = async (page: Page, pageNum: number): Promise<ScrapedPost[]> => {
-    const posts: ScrapedPost[] = [];
-    
-    // phpBB post structure
-    // Posts are typically in .post or div[id^="p"] elements
-    const postElements = await page.locator('.post, div[id^="p"]').all();
-    console.log(`    Found ${postElements.length} post elements on page ${pageNum}`);
-    
-    for (const postEl of postElements) {
-      try {
-        // Get post ID from the element or its anchor
-        // phpBB posts have id like "p1234567" or contain #p1234567 anchor
+    // Run extraction entirely in the browser context — one call, no locator timeouts
+    // The callback runs in the browser, so DOM types are available at runtime.
+    // We use explicit return type to satisfy TypeScript without needing 'dom' lib.
+    const rawPosts = await page.evaluate((pgNum) => {
+      const results: Array<{
+        externalId: string;
+        contentHtml: string;
+        authorName: string | null;
+        dateIso: string | null;
+        dateText: string | null;
+      }> = [];
+
+      const postElements = document.querySelectorAll('.post, div[id^="p"]');
+
+      postElements.forEach((postEl: Element, i: number) => {
+        // 1. Get post ID
         let externalId: string | null = null;
-        
-        // Try to get ID from element
-        const elementId = await postEl.getAttribute('id');
-        if (elementId?.startsWith('p')) {
-          externalId = elementId;
+
+        const elId = postEl.getAttribute('id');
+        if (elId?.startsWith('p')) {
+          externalId = elId;
         }
-        
-        // Try to get from anchor link
+
         if (!externalId) {
-          try {
-            const anchor = postEl.locator('a[href*="#p"]').first();
-            const href = await anchor.getAttribute('href');
-            if (href) {
-              const match = href.match(/#(p\d+)/);
-              if (match && match[1]) {
-                externalId = match[1];
-              }
+          const anchor = postEl.querySelector('a[href*="#p"]');
+          if (anchor) {
+            const href = anchor.getAttribute('href') || '';
+            const match = href.match(/#(p\d+)/);
+            if (match?.[1]) {
+              externalId = match[1];
             }
-          } catch {
-            // No anchor found
           }
         }
-        
-        // Fallback: generate ID from page and position
+
         if (!externalId) {
-          const index = postElements.indexOf(postEl);
-          externalId = `page${pageNum}-post${index}`;
+          externalId = `page${pgNum}-post${i}`;
         }
-        
-        // Get post content - use innerHTML to properly strip quotes
-        let content = '';
-        try {
-          // Try phpBB content selectors
-          const contentEl = postEl.locator('.content, .postbody .content, .post-text').first();
-          const rawHtml = await contentEl.innerHTML();
-          
-          // Strip quoted content and convert to text (uses shared utility)
-          content = stripHtmlWithQuotes(rawHtml);
-        } catch {
-          // Fallback to textContent
-          content = (await postEl.textContent()) || '';
-        }
-        
+
+        // 2. Get content HTML (to be stripped in Node)
+        const contentEl = postEl.querySelector('.content, .postbody .content, .post-text');
+        const contentHtml = contentEl ? contentEl.innerHTML : (postEl.textContent || '');
+
+        // 3. Get author name
+        const authorEl = postEl.querySelector('.postprofile .username, .author .username, .postauthor');
+        const authorName = authorEl ? authorEl.textContent?.trim() || null : null;
+
+        // 4. Get date
+        const dateEl = postEl.querySelector('.postprofile time, .author time, time');
+        const dateIso = dateEl ? dateEl.getAttribute('datetime') : null;
+        const dateText = (!dateIso && dateEl) ? dateEl.textContent?.trim() || null : null;
+
+        results.push({ externalId, contentHtml, authorName, dateIso, dateText });
+      });
+
+      return results;
+    }, pageNum);
+
+    // Process raw posts in Node (strip HTML, parse dates, filter)
+    const posts: ScrapedPost[] = [];
+
+    for (const raw of rawPosts) {
+      try {
+        const content = stripHtmlWithQuotes(raw.contentHtml);
+
         // Skip very short posts (likely empty or just quotes)
         if (content.length < 30) {
           continue;
         }
-        
-        // Get author name
-        let authorName: string | undefined;
-        try {
-          // phpBB author selectors
-          const authorEl = postEl.locator('.postprofile .username, .author .username, .postauthor').first();
-          const authorText = (await authorEl.textContent())?.trim();
-          authorName = authorText || undefined;
-        } catch {
-          // No author found
-        }
-        
-        // Get post date
+
         let postedAt: Date | undefined;
-        try {
-          // phpBB date selectors
-          const dateEl = postEl.locator('.postprofile time, .author time, time').first();
-          const datetime = await dateEl.getAttribute('datetime');
-          if (datetime) {
-            postedAt = new Date(datetime);
-          } else {
-            const dateText = await dateEl.textContent();
-            if (dateText) {
-              postedAt = parsePhpBBDate(dateText);
-            }
-          }
-        } catch {
-          // No date found
+        if (raw.dateIso) {
+          postedAt = new Date(raw.dateIso);
+          if (isNaN(postedAt.getTime())) postedAt = undefined;
+        } else if (raw.dateText) {
+          postedAt = parsePhpBBDate(raw.dateText);
         }
-        
+
         posts.push({
-          externalId,
+          externalId: raw.externalId,
           content,
-          authorName,
+          authorName: raw.authorName || undefined,
           postedAt,
           pageNumber: pageNum,
         });
       } catch (error) {
-        console.log(`    Warning: Error extracting post:`, error);
+        console.log(`    Warning: Error processing post ${raw.externalId} on page ${pageNum}:`, (error as Error).message);
       }
     }
-    
+
     return posts;
+  };
+
+  /**
+   * Process a single page with timeout protection.
+   * Returns null if the page fails after retries (caller should skip and continue).
+   */
+  const processPageWithTimeout = async (
+    page: Page,
+    threadUrl: string,
+    pageNum: number,
+    postsPerPage: number,
+    isFirstPage: boolean,
+  ): Promise<ScrapedPost[] | null> => {
+    return Promise.race([
+      (async () => {
+        if (!isFirstPage) {
+          await navigateToPage(page, threadUrl, pageNum, postsPerPage);
+          await page.waitForSelector('.post, div[id^="p"]', { timeout: 15_000 });
+        }
+        return extractPostsFromPage(page, pageNum);
+      })(),
+      new Promise<null>((_, reject) =>
+        setTimeout(() => reject(new Error(`Page ${pageNum} timed out after ${PAGE_TIMEOUT_MS / 1000}s`)), PAGE_TIMEOUT_MS)
+      ),
+    ]);
+  };
+
+  /**
+   * Format seconds into human-readable duration
+   */
+  const formatDuration = (seconds: number): string => {
+    if (seconds < 60) return `${Math.round(seconds)}s`;
+    if (seconds < 3600) return `${Math.floor(seconds / 60)}m ${Math.round(seconds % 60)}s`;
+    const hours = Math.floor(seconds / 3600);
+    const mins = Math.floor((seconds % 3600) / 60);
+    return `${hours}h ${mins}m`;
   };
 
   return {
     name: source.name,
     type: source.type as 'playwright' | 'fetch',
 
-    async getThreads(options): Promise<ScrapedThread[]> {
+    async getThreads(): Promise<ScrapedThread[]> {
       const config = getConfig();
-      
-      // For this adapter, we have a single hardcoded thread
-      // In the future, you could expand this to discover threads from a forum section
       const threadUrl = config.threadUrl;
       
-      // Extract thread ID from URL
       const threadIdMatch = threadUrl.match(/t=(\d+)/);
       const externalId = threadIdMatch ? `t${threadIdMatch[1]}` : 'unknown';
       
@@ -343,96 +535,174 @@ export function createImmigrationBoardsAdapter(source: SourceForum): SourceAdapt
         externalId,
         url: threadUrl,
         title: 'ILR TIMELINES- SET(O) SET(F) SET(M) (not Set(LR) PLS)',
-        postedAt: new Date('2017-05-21'), // Original thread date
+        postedAt: new Date('2017-05-21'),
       }];
     },
 
-    async getPosts(thread, options = {}): Promise<{ posts: ScrapedPost[]; progress: ScrapeProgress }> {
+    async getPosts(thread, options = {}): Promise<GetPostsResult> {
       const config = getConfig();
-      const posts: ScrapedPost[] = [];
       const startFromPage = options.startFromPage || 1;
+      let totalPostsScraped = 0;
       
-      const browser = await initBrowser();
-      const context = await browser.newContext({
-        userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-      });
-      const page = await context.newPage();
+      // Reset popup state for new scrape session
+      popupState.consent = false;
+      popupState.notifications = false;
+      popupState.login = false;
+      popupState.doNotShow = false;
+      
+      let currentBrowser = await initBrowser();
+      let context = await createContext(currentBrowser);
+      let page = await context.newPage();
 
-      // Block unnecessary resources for speed
-      await page.route('**/*', (route) => {
-        const resourceType = route.request().resourceType();
-        if (['image', 'stylesheet', 'font', 'media'].includes(resourceType)) {
-          route.abort();
-        } else {
-          route.continue();
-        }
-      });
+      // Block heavy resources for speed, but keep stylesheets
+      const setupResourceBlocking = async (p: Page) => {
+        await p.route('**/*', (route) => {
+          const resourceType = route.request().resourceType();
+          if (['image', 'font', 'media'].includes(resourceType)) {
+            route.abort();
+          } else {
+            route.continue();
+          }
+        });
+      };
+      await setupResourceBlocking(page);
 
       let totalPages = 1;
       let currentPage = startFromPage;
+      let consecutiveFailures = 0;
+      const startTime = Date.now();
+      let pagesCompleted = 0;
 
       try {
-        // Navigate to starting page (or page 1 if fresh start)
-        // We can get totalPages from the pagination on any page
-        await navigateToPage(page, thread.url, startFromPage, config.postsPerPage);
-        await page.waitForSelector('.post, div[id^="p"]', { timeout: 15000 });
+        // Navigate to starting page to get total pages
+        const cleanThreadUrl = stripSessionId(thread.url);
+        await navigateToPage(page, cleanThreadUrl, startFromPage, config.postsPerPage);
+        await page.waitForSelector('.post, div[id^="p"]', { timeout: 15_000 });
         
         totalPages = await getTotalPages(page);
-        console.log(`  Thread has ${totalPages} pages total, starting from page ${startFromPage}`);
+        const totalPagesToScrape = totalPages - startFromPage + 1;
+        console.log(`  Thread has ${totalPages} pages total, scraping ${totalPagesToScrape} pages (${startFromPage} to ${totalPages})`);
         
-        // Scrape pages from startFromPage to end
+        // Scrape pages — stream each page's posts to the caller immediately
         for (currentPage = startFromPage; currentPage <= totalPages; currentPage++) {
-          // We already navigated to startFromPage above, so only navigate for subsequent pages
-          if (currentPage > startFromPage) {
-            await navigateToPage(page, thread.url, currentPage, config.postsPerPage);
-            // Wait for posts to load
-            await page.waitForSelector('.post, div[id^="p"]', { timeout: 15000 });
+          const isFirstPage = currentPage === startFromPage;
+
+          try {
+            const pagePosts = await processPageWithTimeout(
+              page, cleanThreadUrl, currentPage, config.postsPerPage, isFirstPage
+            );
+
+            if (pagePosts && pagePosts.length > 0) {
+              // Stream posts to caller for immediate DB persistence
+              if (options.onPageData) {
+                await options.onPageData(pagePosts, currentPage);
+              }
+
+              totalPostsScraped += pagePosts.length;
+              consecutiveFailures = 0;
+              pagesCompleted++;
+              
+              // Progress logging with ETA
+              const elapsed = (Date.now() - startTime) / 1000;
+              const avgPerPage = elapsed / pagesCompleted;
+              const remaining = (totalPages - currentPage) * avgPerPage;
+              
+              if (currentPage === startFromPage || currentPage % 10 === 0 || currentPage === totalPages) {
+                console.log(
+                  `    Page ${currentPage}/${totalPages}: ${pagePosts.length} posts` +
+                  ` | ${pagesCompleted}/${totalPagesToScrape} done` +
+                  ` | ETA: ${formatDuration(remaining)}` +
+                  ` | Total posts: ${totalPostsScraped}`
+                );
+              }
+            } else {
+              console.warn(`    Page ${currentPage}: No posts extracted (skipping)`);
+              consecutiveFailures++;
+            }
+          } catch (error) {
+            consecutiveFailures++;
+            const errMsg = error instanceof Error ? error.message : String(error);
+            console.error(`    Page ${currentPage} failed (${consecutiveFailures}/${MAX_CONSECUTIVE_FAILURES}): ${errMsg}`);
+
+            // If browser crashed, try to recover
+            if (errMsg.includes('Target closed') || errMsg.includes('browser has been closed') || errMsg.includes('Protocol error')) {
+              console.log('    Browser appears crashed, attempting recovery...');
+              try {
+                await context.close().catch(() => {});
+                await closeBrowser();
+                
+                currentBrowser = await initBrowser();
+                context = await createContext(currentBrowser);
+                page = await context.newPage();
+                await setupResourceBlocking(page);
+                
+                // Reset popup state since we have a new context
+                popupState.consent = false;
+                popupState.notifications = false;
+                popupState.login = false;
+                popupState.doNotShow = false;
+                
+                console.log('    Browser recovered, resuming from page', currentPage);
+                consecutiveFailures = 0;
+                currentPage--; // Retry this page
+                continue;
+              } catch (recoveryError) {
+                console.error('    Browser recovery failed:', (recoveryError as Error).message);
+              }
+            }
+          }
+
+          // Abort if too many consecutive failures
+          if (consecutiveFailures >= MAX_CONSECUTIVE_FAILURES) {
+            console.error(`  Aborting: ${MAX_CONSECUTIVE_FAILURES} consecutive page failures`);
+            break;
           }
           
-          // Extract posts from this page
-          const pagePosts = await extractPostsFromPage(page, currentPage);
-          posts.push(...pagePosts);
-          console.log(`    Extracted ${pagePosts.length} posts from page ${currentPage}`);
-          
-          // Report progress if callback provided
-          const progress: ScrapeProgress = {
-            lastScrapedPage: currentPage,
-            totalPages,
-          };
-          
+          // Report progress (for saving resume state in DB)
           if (options.onProgress) {
-            await options.onProgress(progress);
+            await options.onProgress({ lastScrapedPage: currentPage, totalPages });
           }
           
           // Rate limiting between pages
           if (currentPage < totalPages) {
             const waitTime = getJitter();
-            console.log(`    Waiting ${Math.round(waitTime / 1000)}s before next page...`);
             await delay(waitTime);
           }
         }
         
+        // Final summary
+        const totalElapsed = (Date.now() - startTime) / 1000;
+        console.log(
+          `  Scrape complete: ${totalPostsScraped} posts from ${pagesCompleted} pages in ${formatDuration(totalElapsed)}` +
+          (consecutiveFailures >= MAX_CONSECUTIVE_FAILURES ? ' (aborted due to failures)' : '')
+        );
+        
         return {
-          posts,
+          totalPosts: totalPostsScraped,
           progress: {
-            lastScrapedPage: totalPages,
+            lastScrapedPage: consecutiveFailures >= MAX_CONSECUTIVE_FAILURES
+              ? currentPage - consecutiveFailures
+              : totalPages,
             totalPages,
           },
         };
       } catch (error) {
-        console.error(`  Error scraping thread at page ${currentPage}:`, error);
+        const totalElapsed = (Date.now() - startTime) / 1000;
+        console.error(`  Error scraping thread at page ${currentPage} after ${formatDuration(totalElapsed)}:`, error);
         
-        // Return what we have so far with current progress
         return {
-          posts,
+          totalPosts: totalPostsScraped,
           progress: {
-            lastScrapedPage: currentPage - 1, // Last successfully completed page
+            lastScrapedPage: Math.max(currentPage - 1, startFromPage),
             totalPages,
           },
         };
       } finally {
-        await context.close();
-        // Don't close browser here - might be reused
+        try {
+          await context.close();
+        } catch {
+          // Context may already be closed
+        }
       }
     },
 

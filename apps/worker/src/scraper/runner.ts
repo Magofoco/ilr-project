@@ -1,7 +1,7 @@
 import { prisma, Prisma, type SourceForum } from '@ilr/db';
 import type { SourceAdapter, ScrapedPost, ScrapeProgress } from '@ilr/shared';
 import { retryWithBackoff } from '@ilr/shared';
-import { extractCaseData } from '../extraction/extractor.js';
+import { extractCaseData, EXTRACTOR_VERSION } from '../extraction/extractor.js';
 import { hashContent, delay, getJitter } from '../utils/helpers.js';
 
 interface RunScraperOptions {
@@ -10,7 +10,7 @@ interface RunScraperOptions {
   since?: Date;
   maxThreads?: number;
   dryRun: boolean;
-  resume?: boolean; // Whether to resume from last scraped page
+  resume?: boolean;
 }
 
 // Batch size for database operations
@@ -18,6 +18,9 @@ const BATCH_SIZE = 50;
 
 // Pages to process before saving to DB (chunked processing)
 const PAGES_PER_CHUNK = 10;
+
+// Memory warning threshold (500 MB)
+const MEMORY_WARNING_MB = 500;
 
 interface PostWithHash extends ScrapedPost {
   contentHash: string;
@@ -29,12 +32,33 @@ let currentAdapter: SourceAdapter | null = null;
 let shutdownRequested = false;
 
 /**
+ * Log memory usage if it exceeds the warning threshold.
+ */
+function checkMemory(label: string): void {
+  const usage = process.memoryUsage();
+  const heapMB = Math.round(usage.heapUsed / 1024 / 1024);
+  if (heapMB > MEMORY_WARNING_MB) {
+    console.warn(`  [MEMORY WARNING] ${label}: Heap ${heapMB}MB (RSS ${Math.round(usage.rss / 1024 / 1024)}MB)`);
+  }
+}
+
+/**
+ * Format seconds into human-readable duration
+ */
+function formatDuration(seconds: number): string {
+  if (seconds < 60) return `${Math.round(seconds)}s`;
+  if (seconds < 3600) return `${Math.floor(seconds / 60)}m ${Math.round(seconds % 60)}s`;
+  const hours = Math.floor(seconds / 3600);
+  const mins = Math.floor((seconds % 3600) / 60);
+  return `${hours}h ${mins}m`;
+}
+
+/**
  * Graceful shutdown handler - called when SIGINT/SIGTERM received
  */
 export async function gracefulShutdown(): Promise<void> {
   shutdownRequested = true;
   
-  // Mark current scrape run as failed if one is running
   if (currentScrapeRunId) {
     try {
       await prisma.scrapeRun.update({
@@ -51,7 +75,6 @@ export async function gracefulShutdown(): Promise<void> {
     }
   }
   
-  // Cleanup adapter resources
   if (currentAdapter?.cleanup) {
     try {
       await currentAdapter.cleanup();
@@ -61,19 +84,23 @@ export async function gracefulShutdown(): Promise<void> {
     }
   }
   
-  // Disconnect from database
   await prisma.$disconnect();
 }
 
-/**
- * Check if shutdown was requested
- */
 function shouldStop(): boolean {
   return shutdownRequested;
 }
 
 export async function runScraper(options: RunScraperOptions): Promise<void> {
   const { source, adapter, since, maxThreads, dryRun, resume = true } = options;
+  const runStartTime = Date.now();
+
+  // Debug: verify DB connection goes where we expect
+  const dbCheck = await prisma.$queryRaw<Array<{ current_database: string; post_count: bigint }>>`
+    SELECT current_database(), (SELECT COUNT(*) FROM posts) as post_count
+  `;
+  console.log(`DB check: database=${dbCheck[0]?.current_database}, existing posts=${dbCheck[0]?.post_count}`);
+  console.log(`DATABASE_URL=${process.env.DATABASE_URL?.replace(/:[^@]*@/, ':***@')}`);
 
   // Reset shutdown flag
   shutdownRequested = false;
@@ -90,13 +117,14 @@ export async function runScraper(options: RunScraperOptions): Promise<void> {
             since: since?.toISOString(),
             maxThreads,
             resume,
+            extractorVersion: EXTRACTOR_VERSION,
           },
         },
       });
 
   currentScrapeRunId = scrapeRun?.id || null;
 
-  let stats = {
+  const stats = {
     threadsFound: 0,
     threadsScraped: 0,
     postsFound: 0,
@@ -109,7 +137,7 @@ export async function runScraper(options: RunScraperOptions): Promise<void> {
     console.log('Fetching thread list...');
     const threads = await adapter.getThreads({ since, maxThreads });
     stats.threadsFound = threads.length;
-    console.log(`Found ${threads.length} threads`);
+    console.log(`Found ${threads.length} thread(s)`);
 
     // Step 2: Process each thread
     for (let i = 0; i < threads.length; i++) {
@@ -119,11 +147,14 @@ export async function runScraper(options: RunScraperOptions): Promise<void> {
       }
 
       const thread = threads[i]!;
-      console.log(`[${i + 1}/${threads.length}] Processing: ${thread.title.slice(0, 50)}...`);
+      const threadStartTime = Date.now();
+      console.log(`\n[${i + 1}/${threads.length}] Processing: ${thread.title.slice(0, 60)}...`);
 
       try {
-        // Rate limiting with jitter
-        await delay(getJitter());
+        // Rate limiting with jitter (skip for the first thread)
+        if (i > 0) {
+          await delay(getJitter());
+        }
 
         // Get or create thread in DB
         const dbThread = dryRun
@@ -164,28 +195,39 @@ export async function runScraper(options: RunScraperOptions): Promise<void> {
           console.log(`  Resuming from page ${startFromPage}`);
         }
 
-        // Step 3: Get posts from thread with chunked progress tracking
-        let totalPages = 1;
-        let currentChunkStart = startFromPage;
+        // Step 3: Scrape posts with streaming — each page is written to DB as it arrives
         let allPostsProcessed = 0;
         let allCasesExtracted = 0;
 
-        // First, get total pages
-        const initialResult = await adapter.getPosts(thread, {
-          startFromPage: 1,
-          onProgress: async (progress) => {
-            totalPages = progress.totalPages;
-          },
-        });
-
-        // If we only fetched page 1 to get total, we need to refetch from startFromPage
-        // But our adapter fetches all pages at once, so we use chunked approach differently
-        
-        // For chunked processing, we process the posts in chunks after fetching
-        const { posts, progress } = await adapter.getPosts(thread, {
+        const { totalPosts, progress } = await adapter.getPosts(thread, {
           startFromPage,
+
+          // Called for each page's posts — persist to DB immediately
+          onPageData: async (pagePosts, pageNum) => {
+            if (shouldStop()) {
+              throw new Error('Shutdown requested');
+            }
+
+            if (dryRun) {
+              for (const post of pagePosts) {
+                const extraction = extractCaseData(post.content);
+                if (extraction.confidence > 0.3) {
+                  console.log(`    [DRY RUN] Would extract: ${extraction.applicationRoute || 'unknown route'} (${(extraction.confidence * 100).toFixed(0)}%)`);
+                  stats.casesExtracted++;
+                }
+                stats.postsScraped++;
+              }
+            } else if (dbThread) {
+              const result = await processPostsInBatches(dbThread.id, pagePosts);
+              allPostsProcessed += result.postsProcessed;
+              allCasesExtracted += result.casesExtracted;
+            }
+
+            stats.postsFound += pagePosts.length;
+          },
+
+          // Called with progress for saving resume state
           onProgress: async (prog: ScrapeProgress) => {
-            // Save progress every PAGES_PER_CHUNK pages
             if (!dryRun && dbThread && prog.lastScrapedPage % PAGES_PER_CHUNK === 0) {
               await retryWithBackoff(
                 () => prisma.thread.update({
@@ -199,64 +241,19 @@ export async function runScraper(options: RunScraperOptions): Promise<void> {
               );
             }
             
-            // Check for shutdown
             if (shouldStop()) {
               throw new Error('Shutdown requested');
             }
           },
         });
 
-        stats.postsFound += posts.length;
-        console.log(`  Found ${posts.length} posts (pages ${startFromPage}-${progress.lastScrapedPage} of ${progress.totalPages})`);
-
-        // Step 4: Process posts in chunks
-        if (dryRun) {
-          for (const post of posts) {
-            if (shouldStop()) break;
-            const extraction = extractCaseData(post.content);
-            if (extraction.confidence > 0.3) {
-              console.log(`    [DRY RUN] Would extract: ${extraction.applicationRoute || 'unknown route'} (${(extraction.confidence * 100).toFixed(0)}%)`);
-              stats.casesExtracted++;
-            }
-            stats.postsScraped++;
-          }
-        } else if (dbThread) {
-          // Process in chunks of posts from PAGES_PER_CHUNK pages
-          const postsPerChunk = PAGES_PER_CHUNK * 25; // ~250 posts per chunk
-          
-          for (let chunkStart = 0; chunkStart < posts.length; chunkStart += postsPerChunk) {
-            if (shouldStop()) {
-              console.log('  Shutdown requested, saving progress...');
-              break;
-            }
-
-            const chunk = posts.slice(chunkStart, chunkStart + postsPerChunk);
-            console.log(`  Processing chunk ${Math.floor(chunkStart / postsPerChunk) + 1}/${Math.ceil(posts.length / postsPerChunk)} (${chunk.length} posts)...`);
-            
-            const result = await processPostsInBatches(dbThread.id, chunk);
-            allPostsProcessed += result.postsProcessed;
-            allCasesExtracted += result.casesExtracted;
-            
-            // Update progress after each chunk
-            const lastPageInChunk = Math.max(...chunk.map(p => p.pageNumber || 0));
-            if (lastPageInChunk > 0) {
-              await retryWithBackoff(
-                () => prisma.thread.update({
-                  where: { id: dbThread.id },
-                  data: {
-                    lastScrapedPage: lastPageInChunk,
-                    totalPages: progress.totalPages,
-                  },
-                }),
-                { maxAttempts: 2 }
-              );
-            }
-          }
-          
+        if (!dryRun) {
           stats.postsScraped += allPostsProcessed;
           stats.casesExtracted += allCasesExtracted;
-          console.log(`  Processed ${allPostsProcessed} posts, extracted ${allCasesExtracted} cases`);
         }
+
+        const threadElapsed = (Date.now() - threadStartTime) / 1000;
+        console.log(`  Thread complete: ${totalPosts} posts scraped, ${allPostsProcessed} processed, ${allCasesExtracted} cases in ${formatDuration(threadElapsed)}`);
 
         // Update final progress
         if (!dryRun && dbThread && !shouldStop()) {
@@ -279,8 +276,7 @@ export async function runScraper(options: RunScraperOptions): Promise<void> {
           console.log('  Stopped due to shutdown request');
           break;
         }
-        console.error(`  Error processing thread ${thread.externalId}:`, error);
-        // Continue with other threads
+        console.error(`  Error processing thread ${thread.externalId}:`, error instanceof Error ? error.message : error);
       }
     }
 
@@ -304,7 +300,9 @@ export async function runScraper(options: RunScraperOptions): Promise<void> {
     }
     currentScrapeRunId = null;
 
-    console.log('\nScrape stats:', stats);
+    const totalElapsed = (Date.now() - runStartTime) / 1000;
+    console.log(`\nScrape complete in ${formatDuration(totalElapsed)}`);
+    console.log('Stats:', JSON.stringify(stats, null, 2));
   } catch (error) {
     // Cleanup adapter resources on error
     if (adapter.cleanup) {
@@ -318,16 +316,20 @@ export async function runScraper(options: RunScraperOptions): Promise<void> {
 
     // Update scrape run with failure
     if (scrapeRun) {
-      await prisma.scrapeRun.update({
-        where: { id: scrapeRun.id },
-        data: {
-          status: 'failed',
-          completedAt: new Date(),
-          errorMessage: error instanceof Error ? error.message : 'Unknown error',
-          errorDetails: error instanceof Error ? { stack: error.stack } : {},
-          ...stats,
-        },
-      });
+      try {
+        await prisma.scrapeRun.update({
+          where: { id: scrapeRun.id },
+          data: {
+            status: 'failed',
+            completedAt: new Date(),
+            errorMessage: error instanceof Error ? error.message : 'Unknown error',
+            errorDetails: error instanceof Error ? { stack: error.stack } : {},
+            ...stats,
+          },
+        });
+      } catch (updateError) {
+        console.error('  Failed to update scrape run status:', updateError);
+      }
     }
     currentScrapeRunId = null;
     
@@ -336,7 +338,8 @@ export async function runScraper(options: RunScraperOptions): Promise<void> {
 }
 
 /**
- * Process posts in batches for better performance
+ * Process posts in batches for better performance.
+ * Handles deduplication via content hashing, and extracts case data for new/changed posts.
  */
 async function processPostsInBatches(
   threadId: string,
@@ -382,10 +385,10 @@ async function processPostsInBatches(
     } else if (existing.contentHash !== post.contentHash) {
       changedPosts.push(post);
     }
-    // Unchanged posts are skipped
   }
 
-  console.log(`    New: ${newPosts.length}, Changed: ${changedPosts.length}, Unchanged: ${posts.length - newPosts.length - changedPosts.length}`);
+  const unchangedCount = posts.length - newPosts.length - changedPosts.length;
+  console.log(`    New: ${newPosts.length}, Changed: ${changedPosts.length}, Unchanged: ${unchangedCount}`);
 
   // Process new posts in batches with retry
   for (let i = 0; i < newPosts.length; i += BATCH_SIZE) {
@@ -437,6 +440,7 @@ async function processPostsInBatches(
               outcome: extraction.outcome,
               confidence: extraction.confidence,
               extractionNotes: extraction.extractionNotes,
+              extractorVersion: EXTRACTOR_VERSION,
             });
           }
         }
@@ -469,7 +473,6 @@ async function processPostsInBatches(
 
     await retryWithBackoff(
       () => prisma.$transaction(async (tx) => {
-        // Update post
         await tx.post.update({
           where: { id: existing.id },
           data: {
@@ -480,7 +483,6 @@ async function processPostsInBatches(
           },
         });
 
-        // Re-extract case data
         const extraction = extractCaseData(post.content);
         if (extraction.confidence > 0.3) {
           await tx.extractedCase.upsert({
@@ -498,6 +500,7 @@ async function processPostsInBatches(
               outcome: extraction.outcome,
               confidence: extraction.confidence,
               extractionNotes: extraction.extractionNotes,
+              extractorVersion: EXTRACTOR_VERSION,
             },
             update: {
               applicationType: extraction.applicationType,
@@ -511,6 +514,7 @@ async function processPostsInBatches(
               outcome: extraction.outcome,
               confidence: extraction.confidence,
               extractionNotes: extraction.extractionNotes,
+              extractorVersion: EXTRACTOR_VERSION,
               extractedAt: new Date(),
             },
           });

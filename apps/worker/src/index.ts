@@ -1,7 +1,24 @@
 import { Command } from 'commander';
 import { prisma } from '@ilr/db';
 import { runScraper, gracefulShutdown } from './scraper/runner.js';
-import { getSourceAdapter } from './sources/index.js';
+import { getSourceAdapter, listAvailableAdapters } from './sources/index.js';
+
+// ============================================
+// ENVIRONMENT VALIDATION
+// ============================================
+
+const requiredEnvVars = ['DATABASE_URL'] as const;
+for (const envVar of requiredEnvVars) {
+  if (!process.env[envVar]) {
+    console.error(`Missing required environment variable: ${envVar}`);
+    console.error('Ensure your .env file is loaded or the variable is set.');
+    process.exit(1);
+  }
+}
+
+// ============================================
+// CLI SETUP
+// ============================================
 
 const program = new Command();
 
@@ -27,10 +44,21 @@ const handleShutdown = async (signal: string) => {
 process.on('SIGINT', () => handleShutdown('SIGINT'));
 process.on('SIGTERM', () => handleShutdown('SIGTERM'));
 
+// Handle uncaught errors
+process.on('unhandledRejection', (reason) => {
+  console.error('Unhandled rejection:', reason);
+  handleShutdown('unhandledRejection');
+});
+
+process.on('uncaughtException', (error) => {
+  console.error('Uncaught exception:', error);
+  handleShutdown('uncaughtException');
+});
+
 program
   .name('ilr-worker')
   .description('ILR Tracker scraper worker')
-  .version('0.0.1');
+  .version('0.1.0');
 
 program
   .command('run')
@@ -43,28 +71,52 @@ program
   .action(async (options) => {
     const { source: sourceName, since, maxThreads, dryRun, resume } = options;
 
-    console.log(`Starting scraper for source: ${sourceName}`);
-    console.log(`Options: since=${since || 'all'}, maxThreads=${maxThreads || 'unlimited'}, dryRun=${dryRun || false}, resume=${resume}`);
+    console.log(`\n========================================`);
+    console.log(`ILR Worker - Scrape Run`);
+    console.log(`========================================`);
+    console.log(`Source:     ${sourceName}`);
+    console.log(`Since:      ${since || 'all time'}`);
+    console.log(`Max threads: ${maxThreads || 'unlimited'}`);
+    console.log(`Dry run:    ${dryRun || false}`);
+    console.log(`Resume:     ${resume}`);
+    console.log(`========================================\n`);
+
+    // Validate --since date
+    if (since) {
+      const parsed = new Date(since);
+      if (isNaN(parsed.getTime())) {
+        console.error(`Invalid --since date: "${since}". Use ISO format (e.g., 2025-01-01)`);
+        process.exit(1);
+      }
+    }
 
     try {
+      // Verify database connection
+      await prisma.$queryRaw`SELECT 1`;
+      
       // Get source from database
       const source = await prisma.sourceForum.findUnique({
         where: { name: sourceName },
       });
 
       if (!source) {
-        console.error(`Source not found: ${sourceName}`);
+        const available = listAvailableAdapters();
+        console.error(`Source not found: "${sourceName}"`);
+        console.error(`Available adapters: ${available.join(', ')}`);
+        console.error(`\nMake sure to run the seed first: pnpm --filter @ilr/worker run seed`);
         process.exit(1);
       }
 
       if (!source.isActive) {
-        console.warn(`Source is not active: ${sourceName}`);
+        console.warn(`Warning: Source "${sourceName}" is not active. Running anyway...`);
       }
 
       // Get the adapter for this source
       const adapter = getSourceAdapter(source);
       if (!adapter) {
-        console.error(`No adapter found for source type: ${source.name}`);
+        const available = listAvailableAdapters();
+        console.error(`No adapter found for source: "${source.name}"`);
+        console.error(`Available adapters: ${available.join(', ')}`);
         process.exit(1);
       }
 
@@ -75,12 +127,12 @@ program
         since: since ? new Date(since) : undefined,
         maxThreads,
         dryRun: dryRun || false,
-        resume: resume !== false, // Default true, false if --no-resume passed
+        resume: resume !== false,
       });
 
-      console.log('Scraper completed successfully');
+      console.log('\nScraper completed successfully');
     } catch (error) {
-      console.error('Scraper failed:', error);
+      console.error('\nScraper failed:', error instanceof Error ? error.message : error);
       process.exit(1);
     } finally {
       await prisma.$disconnect();
@@ -89,67 +141,101 @@ program
 
 program
   .command('list-sources')
-  .description('List all configured sources')
+  .description('List all configured sources and their scrape status')
   .action(async () => {
-    const sources = await prisma.sourceForum.findMany({
-      select: {
-        name: true,
-        displayName: true,
-        type: true,
-        isActive: true,
-        _count: { select: { threads: true } },
-      },
-    });
+    try {
+      const sources = await prisma.sourceForum.findMany({
+        select: {
+          name: true,
+          displayName: true,
+          type: true,
+          isActive: true,
+          _count: { select: { threads: true } },
+        },
+      });
 
-    console.log('\nConfigured sources:');
-    console.log('-------------------');
-    for (const source of sources) {
-      const status = source.isActive ? '✓' : '✗';
-      console.log(`${status} ${source.name} (${source.displayName})`);
-      console.log(`  Type: ${source.type}, Threads: ${source._count.threads}`);
+      const adapters = listAvailableAdapters();
+
+      console.log('\nConfigured sources:');
+      console.log('-------------------');
+      if (sources.length === 0) {
+        console.log('  (none — run seed first)');
+      }
+      for (const source of sources) {
+        const status = source.isActive ? 'active' : 'inactive';
+        const hasAdapter = adapters.includes(source.name) ? 'adapter found' : 'NO ADAPTER';
+        console.log(`  ${source.isActive ? '✓' : '✗'} ${source.name} (${source.displayName})`);
+        console.log(`    Type: ${source.type} | Status: ${status} | Threads: ${source._count.threads} | ${hasAdapter}`);
+      }
+
+      console.log(`\nAvailable adapters: ${adapters.join(', ')}`);
+      console.log();
+    } catch (error) {
+      console.error('Failed to list sources:', error instanceof Error ? error.message : error);
+      process.exit(1);
+    } finally {
+      await prisma.$disconnect();
     }
-    console.log();
-
-    await prisma.$disconnect();
   });
 
 program
   .command('scheduled')
-  .description('Run scheduled scrape for all active sources')
+  .description('Run scheduled scrape for all active sources (used by CI/cron)')
   .action(async () => {
     console.log('Starting scheduled scrape for all active sources...');
+    console.log(`Timestamp: ${new Date().toISOString()}\n`);
 
-    const sources = await prisma.sourceForum.findMany({
-      where: { isActive: true },
-    });
+    let hadErrors = false;
 
-    console.log(`Found ${sources.length} active sources`);
+    try {
+      const sources = await prisma.sourceForum.findMany({
+        where: { isActive: true },
+      });
 
-    for (const source of sources) {
-      console.log(`\nProcessing source: ${source.displayName}`);
-      
-      const adapter = getSourceAdapter(source);
-      if (!adapter) {
-        console.warn(`No adapter for source: ${source.name}, skipping`);
-        continue;
+      console.log(`Found ${sources.length} active source(s)`);
+
+      if (sources.length === 0) {
+        console.log('No active sources to scrape. Exiting.');
+        return;
       }
 
-      try {
-        await runScraper({
-          source,
-          adapter,
-          // For scheduled runs, default to last 24 hours
-          since: new Date(Date.now() - 24 * 60 * 60 * 1000),
-          dryRun: false,
-        });
-      } catch (error) {
-        console.error(`Error scraping ${source.name}:`, error);
-        // Continue with other sources
+      for (const source of sources) {
+        if (isShuttingDown) break;
+
+        console.log(`\n--- Processing source: ${source.displayName} ---`);
+        
+        const adapter = getSourceAdapter(source);
+        if (!adapter) {
+          console.warn(`No adapter for source: ${source.name}, skipping`);
+          hadErrors = true;
+          continue;
+        }
+
+        try {
+          await runScraper({
+            source,
+            adapter,
+            since: new Date(Date.now() - 24 * 60 * 60 * 1000),
+            dryRun: false,
+          });
+        } catch (error) {
+          console.error(`Error scraping ${source.name}:`, error instanceof Error ? error.message : error);
+          hadErrors = true;
+        }
       }
+
+      console.log(`\nScheduled scrape completed${hadErrors ? ' (with errors)' : ''}`);
+    } catch (error) {
+      console.error('Scheduled scrape failed:', error instanceof Error ? error.message : error);
+      process.exit(1);
+    } finally {
+      await prisma.$disconnect();
     }
 
-    console.log('\nScheduled scrape completed');
-    await prisma.$disconnect();
+    // Exit with error code if any source failed (useful for CI alerts)
+    if (hadErrors) {
+      process.exit(1);
+    }
   });
 
 program.parse();

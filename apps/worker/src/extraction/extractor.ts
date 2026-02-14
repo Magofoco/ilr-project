@@ -1,6 +1,13 @@
 import type { ExtractionResult } from '@ilr/shared';
 
 /**
+ * Extractor version - bump this when extraction logic changes significantly.
+ * Stored alongside each extracted case so you can re-extract old posts
+ * when the extractor improves.
+ */
+export const EXTRACTOR_VERSION = '1.1';
+
+/**
  * Extract ILR case data from immigrationboards.com post content
  * 
  * The posts follow a semi-structured format like:

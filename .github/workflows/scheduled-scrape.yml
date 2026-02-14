@@ -5,32 +5,53 @@ on:
     # Run daily at 6 AM UTC
     - cron: '0 6 * * *'
   workflow_dispatch:
-    # Allow manual trigger
     inputs:
       source:
-        description: 'Source name to scrape (leave empty for all)'
+        description: 'Source name to scrape (leave empty for all active sources)'
         required: false
         type: string
+      no_resume:
+        description: 'Start from page 1 instead of resuming'
+        required: false
+        type: boolean
+        default: false
 
 env:
   DATABASE_URL: ${{ secrets.DATABASE_URL }}
   DATABASE_DIRECT_URL: ${{ secrets.DATABASE_DIRECT_URL }}
-  SCRAPE_RATE_LIMIT: 10
-  SCRAPE_JITTER_MIN: 2000
-  SCRAPE_JITTER_MAX: 5000
+  SCRAPE_JITTER_MIN: '3000'
+  SCRAPE_JITTER_MAX: '6000'
 
 jobs:
   scrape:
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    # 162 pages × ~8s/page = ~22 min scrape + build time. 90 min gives margin.
+    timeout-minutes: 90
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
+      # ============================================
+      # VALIDATE SECRETS
+      # ============================================
+      - name: Validate required secrets
+        run: |
+          if [ -z "$DATABASE_URL" ]; then
+            echo "::error::DATABASE_URL secret is not set. Configure it in Settings → Secrets."
+            exit 1
+          fi
+          if [ -z "$DATABASE_DIRECT_URL" ]; then
+            echo "::error::DATABASE_DIRECT_URL secret is not set. Configure it in Settings → Secrets."
+            exit 1
+          fi
+          echo "Secrets validated."
+
+      # ============================================
+      # SETUP
+      # ============================================
       - name: Setup pnpm
         uses: pnpm/action-setup@v4
-        # Version is read from package.json "packageManager" field
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
@@ -47,14 +68,111 @@ jobs:
       - name: Build packages
         run: pnpm run build
 
-      - name: Install Playwright
-        run: npx playwright install chromium
+      - name: Install Playwright Chromium
+        run: npx playwright install chromium --with-deps
         working-directory: apps/worker
 
-      - name: Run Scheduled Scrape
+      # ============================================
+      # SCRAPE
+      # ============================================
+      - name: Run scheduled scrape (all sources)
         if: ${{ !github.event.inputs.source }}
         run: pnpm worker:run scheduled
 
-      - name: Run Single Source Scrape
+      - name: Run single source scrape
         if: ${{ github.event.inputs.source }}
-        run: pnpm worker:run run --source=${{ github.event.inputs.source }}
+        run: |
+          ARGS="run --source=${{ github.event.inputs.source }}"
+          if [ "${{ github.event.inputs.no_resume }}" = "true" ]; then
+            ARGS="$ARGS --no-resume"
+          fi
+          pnpm worker:run $ARGS
+
+      # ============================================
+      # POST-RUN REPORT
+      # ============================================
+      - name: Check scrape results
+        if: always()
+        run: |
+          echo "### Scrape Run Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "- **Trigger**: ${{ github.event_name }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Source**: ${{ github.event.inputs.source || 'all active' }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Status**: ${{ job.status }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Time**: $(date -u '+%Y-%m-%d %H:%M:%S UTC')" >> $GITHUB_STEP_SUMMARY
+
+  # ============================================
+  # FAILURE NOTIFICATION
+  # ============================================
+  notify-failure:
+    runs-on: ubuntu-latest
+    needs: [scrape]
+    if: failure()
+
+    steps:
+      # Option 1: Slack webhook (configure SLACK_WEBHOOK_URL secret)
+      - name: Notify Slack on failure
+        if: ${{ secrets.SLACK_WEBHOOK_URL != '' }}
+        run: |
+          curl -s -X POST "${{ secrets.SLACK_WEBHOOK_URL }}" \
+            -H 'Content-Type: application/json' \
+            -d "{
+              \"text\": \":rotating_light: *ILR Scraper Failed*\",
+              \"blocks\": [
+                {
+                  \"type\": \"section\",
+                  \"text\": {
+                    \"type\": \"mrkdwn\",
+                    \"text\": \":rotating_light: *ILR Scraper Failed*\n\n*Trigger:* ${{ github.event_name }}\n*Source:* ${{ github.event.inputs.source || 'all active' }}\n*Run:* <${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}|View logs>\"
+                  }
+                }
+              ]
+            }"
+
+      # Option 2: GitHub Issue (always works, no extra setup needed)
+      - name: Create GitHub Issue on failure
+        if: ${{ secrets.SLACK_WEBHOOK_URL == '' }}
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const title = `Scheduled scrape failed — ${new Date().toISOString().split('T')[0]}`;
+            const body = [
+              `## Scrape Failure`,
+              ``,
+              `- **Trigger**: \`${context.eventName}\``,
+              `- **Source**: \`${{ github.event.inputs.source || 'all active' }}\``,
+              `- **Run**: [View logs](${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId})`,
+              `- **Time**: ${new Date().toISOString()}`,
+              ``,
+              `Please check the logs and re-run if needed.`,
+            ].join('\n');
+
+            // Check for existing open issue to avoid duplicates
+            const { data: issues } = await github.rest.issues.listForRepo({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              state: 'open',
+              labels: 'scraper-failure',
+              per_page: 1,
+            });
+
+            if (issues.length > 0) {
+              // Comment on existing issue instead of creating a new one
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: issues[0].number,
+                body: body,
+              });
+              console.log(`Commented on existing issue #${issues[0].number}`);
+            } else {
+              // Create new issue
+              await github.rest.issues.create({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                title: title,
+                body: body,
+                labels: ['scraper-failure'],
+              });
+              console.log('Created new failure issue');
+            }

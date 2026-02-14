@@ -111,21 +111,40 @@ export interface ExtractionResult {
   extractionNotes?: string;
 }
 
+export interface GetPostsOptions {
+  /** Page to start scraping from (1-indexed). Used for resume. */
+  startFromPage?: number;
+  
+  /** Called after each page is scraped with that page's posts.
+   *  The runner should persist these immediately — the adapter does NOT accumulate them. */
+  onPageData?: (posts: ScrapedPost[], pageNum: number) => Promise<void>;
+
+  /** Called with progress info (for saving resume state). */
+  onProgress?: (progress: ScrapeProgress) => Promise<void>;
+}
+
+export interface GetPostsResult {
+  /** Total number of posts scraped across all pages. */
+  totalPosts: number;
+  /** Final progress state. */
+  progress: ScrapeProgress;
+}
+
 export interface SourceAdapter {
   name: string;
   type: 'playwright' | 'fetch';
   
-  // Get list of threads to scrape
+  /** Get list of threads to scrape. */
   getThreads(options: { since?: Date; maxThreads?: number }): Promise<ScrapedThread[]>;
   
-  // Get posts from a thread
-  // startFromPage: for resume capability - which page to start from (1-indexed)
-  // Returns posts and progress info
+  /** Scrape posts from a thread, streaming each page via onPageData callback.
+   *  Posts are NOT accumulated in memory — the caller is responsible for persisting
+   *  each page's posts as they arrive. */
   getPosts(
     thread: ScrapedThread, 
-    options?: { startFromPage?: number; onProgress?: (progress: ScrapeProgress) => Promise<void> }
-  ): Promise<{ posts: ScrapedPost[]; progress: ScrapeProgress }>;
+    options?: GetPostsOptions
+  ): Promise<GetPostsResult>;
   
-  // Clean up resources (e.g., close browser)
+  /** Clean up resources (e.g., close browser). */
   cleanup?(): Promise<void>;
 }
