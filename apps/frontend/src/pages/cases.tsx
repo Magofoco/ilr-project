@@ -11,7 +11,9 @@ import { ChevronLeft, ChevronRight, ExternalLink } from 'lucide-react';
 interface FiltersResponse {
   applicationRoutes: string[];
   applicationTypes: string[];
-  serviceCenters: string[];
+  biometricsLocations: string[];
+  serviceTiers: string[];
+  nationalityCodes: string[];
   sources: { id: string; name: string; displayName: string }[];
 }
 
@@ -20,7 +22,7 @@ export function Cases() {
   const [filters, setFilters] = useState({
     applicationRoute: '',
     outcome: '',
-    serviceCenter: '',
+    biometricsLocation: '',
   });
 
   // Fetch filter options
@@ -35,7 +37,7 @@ export function Cases() {
   queryParams.set('limit', '20');
   if (filters.applicationRoute) queryParams.set('applicationRoute', filters.applicationRoute);
   if (filters.outcome) queryParams.set('outcome', filters.outcome);
-  if (filters.serviceCenter) queryParams.set('serviceCenter', filters.serviceCenter);
+  if (filters.biometricsLocation) queryParams.set('biometricsLocation', filters.biometricsLocation);
 
   // Fetch cases
   const { data, isLoading, error } = useQuery({
@@ -49,7 +51,7 @@ export function Cases() {
   };
 
   const clearFilters = () => {
-    setFilters({ applicationRoute: '', outcome: '', serviceCenter: '' });
+    setFilters({ applicationRoute: '', outcome: '', biometricsLocation: '' });
     setPage(1);
   };
 
@@ -102,17 +104,17 @@ export function Cases() {
             </Select>
 
             <Select
-              value={filters.serviceCenter}
-              onValueChange={(v) => handleFilterChange('serviceCenter', v)}
+              value={filters.biometricsLocation}
+              onValueChange={(v) => handleFilterChange('biometricsLocation', v)}
             >
               <SelectTrigger className="w-[180px]">
-                <SelectValue placeholder="Service Center" />
+                <SelectValue placeholder="Biometrics location" />
               </SelectTrigger>
               <SelectContent>
-                <SelectItem value="">All centers</SelectItem>
-                {filterOptions?.serviceCenters.map((center) => (
-                  <SelectItem key={center} value={center}>
-                    {center}
+                <SelectItem value="">All locations</SelectItem>
+                {filterOptions?.biometricsLocations.map((location) => (
+                  <SelectItem key={location} value={location}>
+                    {location}
                   </SelectItem>
                 ))}
               </SelectContent>
@@ -157,7 +159,7 @@ export function Cases() {
                       <th className="px-4 py-3">Decision</th>
                       <th className="px-4 py-3">Wait</th>
                       <th className="px-4 py-3">Outcome</th>
-                      <th className="px-4 py-3">Center</th>
+                      <th className="px-4 py-3">Biometrics</th>
                       <th className="px-4 py-3">Confidence</th>
                       <th className="px-4 py-3">Source</th>
                     </tr>
@@ -181,7 +183,7 @@ export function Cases() {
                           <OutcomeBadge outcome={caseItem.outcome} />
                         </td>
                         <td className="px-4 py-3">
-                          {caseItem.serviceCenter || '-'}
+                          {caseItem.biometricsLocation || '-'}
                         </td>
                         <td className="px-4 py-3">
                           <ConfidenceBadge confidence={caseItem.confidence} />

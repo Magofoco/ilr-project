@@ -9,7 +9,9 @@
     "build": "tsc",
     "type-check": "tsc --noEmit",
     "seed": "tsx src/seed.ts",
-    "test:extract": "tsx src/test-extraction.ts"
+    "test:extract": "tsx src/test-extraction.ts",
+    "test:km": "tsx src/test-kaplan-meier.ts",
+    "test": "tsx src/test-extraction.ts && tsx src/test-kaplan-meier.ts"
   },
   "dependencies": {
     "@ilr/db": "workspace:*",

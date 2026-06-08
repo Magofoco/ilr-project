@@ -1,107 +1,107 @@
 import type { FastifyInstance } from 'fastify';
-import { prisma, Prisma } from '@ilr/db';
+import { prisma } from '@ilr/db';
+import { kaplanMeier, kmPercentile } from '@ilr/shared';
 import type { OverviewStats } from '@ilr/shared';
+import { buildKmInputs, computeApprovalRate, loadCohort } from '../lib/cohort.js';
+
+const DAY_MS = 1000 * 60 * 60 * 24;
 
 export async function statsRoutes(fastify: FastifyInstance) {
   // Auth is handled by the authenticated scope in index.ts.
-  // All routes here automatically require a valid JWT.
 
-  // Overview stats
   fastify.get('/overview', async (): Promise<OverviewStats> => {
-    // Get total cases with valid waiting days
+    const now = new Date();
+
+    // ============ TOTAL & WINDOW COUNTS ============
+    // We count cases with an application date, regardless of pending state —
+    // pending cases are part of "total cases", they're just censored in the
+    // statistics below.
     const totalCases = await prisma.extractedCase.count({
-      where: { waitingDays: { not: null } },
+      where: { applicationDate: { not: null } },
     });
 
-    // Cases from last 30 days
-    const thirtyDaysAgo = new Date();
-    thirtyDaysAgo.setDate(thirtyDaysAgo.getDate() - 30);
-    
+    const thirtyDaysAgo = new Date(now.getTime() - 30 * DAY_MS);
     const casesLast30Days = await prisma.extractedCase.count({
       where: {
-        waitingDays: { not: null },
+        applicationDate: { not: null },
         createdAt: { gte: thirtyDaysAgo },
       },
     });
 
-    // Get all waiting days for median calculation
-    const allWaitingDays = await prisma.extractedCase.findMany({
-      where: { waitingDays: { not: null } },
-      select: { waitingDays: true },
-      orderBy: { waitingDays: 'asc' },
-    });
+    // ============ KM-BASED MEDIAN OVER LAST 24 MONTHS ============
+    // Use the same cohort helper as /estimate so both endpoints share one
+    // statistical lens. windowDays=730 = last 2 years, matching the default
+    // estimator window.
+    const cohort = await loadCohort({ windowDays: 730 }, now);
+    const kmInputs = buildKmInputs(cohort, now);
+    const km = kaplanMeier(kmInputs);
 
-    const waitingDaysValues = allWaitingDays
-      .map((c: { waitingDays: number | null }) => c.waitingDays)
-      .filter((d: number | null): d is number => d !== null);
+    const medianWaitingDays = kmPercentile(km, 0.5);
 
-    const medianWaitingDays = calculateMedian(waitingDaysValues);
-    const averageWaitingDays = waitingDaysValues.length > 0
-      ? Math.round(waitingDaysValues.reduce((a: number, b: number) => a + b, 0) / waitingDaysValues.length)
+    // The mean is reported only over decided cases for transparency — it is
+    // intentionally biased high or low depending on which cases finished first.
+    const decided = cohort.filter((c) => c.decisionDate);
+    const decidedDurations = decided.map(
+      (c) => (c.decisionDate!.getTime() - c.applicationDate.getTime()) / DAY_MS
+    );
+    const averageWaitingDaysDecided = decidedDurations.length
+      ? Math.round(decidedDurations.reduce((a, b) => a + b, 0) / decidedDurations.length)
       : null;
 
-    // Approval rate
-    const outcomeStats = await prisma.extractedCase.groupBy({
-      by: ['outcome'],
-      _count: { outcome: true },
-      where: { outcome: { in: ['approved', 'rejected'] } },
-    });
+    // Approval rate from the same cohort. Returned as a 0–100 percentage to
+    // preserve the previous public contract.
+    const approvalFraction = computeApprovalRate(cohort);
+    const approvalRate = approvalFraction !== null ? Math.round(approvalFraction * 100) : null;
 
-    const approved = outcomeStats.find((s: { outcome: string | null }) => s.outcome === 'approved')?._count.outcome || 0;
-    const rejected = outcomeStats.find((s: { outcome: string | null }) => s.outcome === 'rejected')?._count.outcome || 0;
-    const approvalRate = approved + rejected > 0 
-      ? Math.round((approved / (approved + rejected)) * 100) 
-      : null;
+    const decidedCount = km.decidedCount;
+    const pendingCount = km.censoredCount;
 
-    // Stats by route
+    // ============ BY ROUTE ============
     const byRouteRaw = await prisma.extractedCase.groupBy({
       by: ['applicationRoute'],
       _count: { applicationRoute: true },
-      where: { 
+      where: {
         applicationRoute: { not: null },
-        waitingDays: { not: null },
+        applicationDate: { not: null },
       },
     });
 
     const byRoute = await Promise.all(
       byRouteRaw.map(async (r: { applicationRoute: string | null; _count: { applicationRoute: number } }) => {
-        const routeCases = await prisma.extractedCase.findMany({
-          where: { 
-            applicationRoute: r.applicationRoute,
-            waitingDays: { not: null },
-          },
-          select: { waitingDays: true },
-          orderBy: { waitingDays: 'asc' },
-        });
-        const days = routeCases
-          .map((c: { waitingDays: number | null }) => c.waitingDays)
-          .filter((d: number | null): d is number => d !== null);
+        const subCohort = await loadCohort(
+          { applicationRoute: r.applicationRoute, windowDays: 730 },
+          now
+        );
+        const subKm = kaplanMeier(buildKmInputs(subCohort, now));
         return {
           route: r.applicationRoute || 'Unknown',
           count: r._count.applicationRoute,
-          medianDays: calculateMedian(days),
+          medianDays: kmPercentile(subKm, 0.5),
         };
       })
     );
 
-    // Stats by month (last 12 months)
-    const twelveMonthsAgo = new Date();
-    twelveMonthsAgo.setMonth(twelveMonthsAgo.getMonth() - 12);
-
+    // ============ BY MONTH (last 12 months of decisions) ============
+    // Note: this view is necessarily over decided cases only — "month of
+    // decision" requires a decision. The headline median above is the
+    // pending-aware number.
+    const twelveMonthsAgo = new Date(now.getTime() - 365 * DAY_MS);
     const byMonthCases = await prisma.extractedCase.findMany({
       where: {
         decisionDate: { gte: twelveMonthsAgo },
-        waitingDays: { not: null },
+        applicationDate: { not: null },
       },
-      select: { decisionDate: true, waitingDays: true },
+      select: { decisionDate: true, applicationDate: true },
     });
 
     const monthMap = new Map<string, number[]>();
     for (const c of byMonthCases) {
-      if (c.decisionDate && c.waitingDays !== null) {
+      if (c.decisionDate && c.applicationDate) {
         const key = c.decisionDate.toISOString().slice(0, 7); // YYYY-MM
+        const days = Math.round((c.decisionDate.getTime() - c.applicationDate.getTime()) / DAY_MS);
+        if (days <= 0 || days > 1500) continue;
         const arr = monthMap.get(key) || [];
-        arr.push(c.waitingDays);
+        arr.push(days);
         monthMap.set(key, arr);
       }
     }
@@ -110,7 +110,7 @@ export async function statsRoutes(fastify: FastifyInstance) {
       .map(([month, days]) => ({
         month,
         count: days.length,
-        medianDays: calculateMedian(days),
+        medianDays: simpleMedian(days),
       }))
       .sort((a, b) => a.month.localeCompare(b.month));
 
@@ -118,15 +118,21 @@ export async function statsRoutes(fastify: FastifyInstance) {
       totalCases,
       casesLast30Days,
       medianWaitingDays,
-      averageWaitingDays,
+      averageWaitingDaysDecided,
       approvalRate,
+      decidedCount,
+      pendingCount,
       byRoute,
       byMonth,
     };
   });
 }
 
-function calculateMedian(values: number[]): number | null {
+/**
+ * Simple median over a numeric array. Used for the by-month view, which is
+ * over decided-only cases (no censoring), so a non-KM median is appropriate.
+ */
+function simpleMedian(values: number[]): number | null {
   if (values.length === 0) return null;
   const sorted = [...values].sort((a, b) => a - b);
   const mid = Math.floor(sorted.length / 2);

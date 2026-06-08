@@ -2,6 +2,8 @@ import { Command } from 'commander';
 import { prisma } from '@ilr/db';
 import { runScraper, gracefulShutdown } from './scraper/runner.js';
 import { getSourceAdapter, listAvailableAdapters } from './sources/index.js';
+import { reextract } from './extraction/reextract.js';
+import { EXTRACTOR_VERSION } from './extraction/extractor.js';
 
 // ============================================
 // ENVIRONMENT VALIDATION
@@ -235,6 +237,59 @@ program
     // Exit with error code if any source failed (useful for CI alerts)
     if (hadErrors) {
       process.exit(1);
+    }
+  });
+
+program
+  .command('reextract')
+  .description('Re-run the current extractor over existing posts (no re-scraping).')
+  .option('--version-below <version>', 'Re-extract cases whose extractorVersion is strictly less than this. Defaults to current extractor version.')
+  .option('--all', 'Re-extract every post regardless of current case version.')
+  .option('--since <date>', 'Only re-extract posts scraped since this ISO date.')
+  .option('--limit <n>', 'Maximum number of posts to process.', parseInt)
+  .option('--dry-run', "Don't write to the DB; just report counts.")
+  .option('--batch-size <n>', 'Posts per transaction batch (default: 100).', parseInt)
+  .action(async (options) => {
+    const versionBelow = options.versionBelow as string | undefined;
+    const all = options.all as boolean | undefined;
+    const since = options.since ? new Date(options.since) : undefined;
+
+    if (since && isNaN(since.getTime())) {
+      console.error(`Invalid --since date: "${options.since}". Use ISO format (e.g. 2025-01-01).`);
+      process.exit(1);
+    }
+
+    console.log('\n========================================');
+    console.log('ILR Worker - Re-extract');
+    console.log('========================================');
+    console.log(`Extractor version (current): ${EXTRACTOR_VERSION}`);
+    console.log(`Version below:               ${versionBelow ?? `(default: < ${EXTRACTOR_VERSION})`}`);
+    console.log(`All:                         ${all ?? false}`);
+    console.log(`Since:                       ${since?.toISOString() ?? 'all time'}`);
+    console.log(`Limit:                       ${options.limit ?? 'unlimited'}`);
+    console.log(`Dry run:                     ${options.dryRun ?? false}`);
+    console.log('========================================\n');
+
+    try {
+      await prisma.$queryRaw`SELECT 1`;
+      const stats = await reextract({
+        versionBelow,
+        all,
+        since,
+        limit: options.limit,
+        dryRun: options.dryRun,
+        batchSize: options.batchSize,
+      });
+      console.log('\nRe-extraction complete:');
+      console.log(`  Posts considered: ${stats.postsConsidered}`);
+      console.log(`  Cases upserted:   ${stats.casesUpserted}`);
+      console.log(`  Cases deleted:    ${stats.casesDeleted}`);
+      console.log(`  Below confidence: ${stats.belowConfidence}`);
+    } catch (error) {
+      console.error('\nRe-extraction failed:', error instanceof Error ? error.message : error);
+      process.exit(1);
+    } finally {
+      await prisma.$disconnect();
     }
   });
 

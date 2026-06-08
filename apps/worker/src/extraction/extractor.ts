@@ -1,379 +1,542 @@
-import type { ExtractionResult } from '@ilr/shared';
+import type { ExtractionResult, ExtractedEvent, ServiceTier } from '@ilr/shared';
+import { normalizeNationality } from '@ilr/shared';
 
 /**
- * Extractor version - bump this when extraction logic changes significantly.
- * Stored alongside each extracted case so you can re-extract old posts
- * when the extractor improves.
+ * Extractor version — bump this whenever the extraction logic changes
+ * meaningfully. The runner stamps the version on each extracted case so we
+ * can later re-extract older posts when this improves.
+ *
+ * 1.0 — initial release (regex-based, flat snapshot)
+ * 1.2 — minor pattern improvements
+ * 1.3 — first-class serviceTier; BN(O)/Skilled Worker/GTV/Tier 1;
+ *       biometrics city in parens; docs_requested / docs_submitted milestones;
+ *       UTC date parsing; ISO-3166 nationality codes; emit ExtractedEvent[].
  */
-export const EXTRACTOR_VERSION = '1.2';
+export const EXTRACTOR_VERSION = '1.3';
 
 /**
- * Extract ILR case data from immigrationboards.com post content
- * 
- * The posts follow a semi-structured format like:
- * 
- * Applied for ILR Route : Set(O)
- * Date application sent : 19/12/2016
- * Biometric Letter received : 16/01/2017
- * Date Biometrics Enrolled : 20/01/2017
- * Approval/Refusal Received : 23/05/2017
- * BRP Card Received : 24/05/2017
- * 
- * But formats vary between users. This extractor handles variations.
+ * Extract ILR case data from a forum post.
+ *
+ * Designed primarily against immigrationboards.com posts which loosely follow:
+ *
+ *   Applied for ILR Route : Set (0) (Skilled Worker)
+ *   Date application sent : 4 Feb 2026
+ *   Application Type : Priority (5 days)
+ *   Biometrics Date: 5 Feb 2026 (Wandsworth)
+ *   Acknowledgement email from UKVI: 5 Feb 2026
+ *   Extra Documents requested on 04/03/2026
+ *   follow up email sent 10/03/2026
+ *   Approval email: 6 Feb 2026
+ *   E-visa Status changed to Settled
+ *
+ * but every applicant types it slightly differently, so we use multiple
+ * regex passes and accumulate confidence per match.
  */
 export function extractCaseData(content: string, authorNationality?: string): ExtractionResult {
   const result: ExtractionResult = {
     confidence: 0,
+    events: [],
   };
 
   const notes: string[] = [];
-  let confidenceScore = 0;
-  const maxScore = 10;
+  const events: ExtractedEvent[] = [];
 
-  // Normalize content - preserve line breaks for parsing
-  const lines = content.split(/\n|\r/).map(l => l.trim()).filter(Boolean);
-  const text = content.toLowerCase();
+  // We score per category; each successful field has its own weight.
+  // Final confidence = clamp(score / maxScore, 0, 1).
+  let score = 0;
+  const maxScore = 12;
 
-  // ============================================
-  // APPLICATION TYPE/ROUTE EXTRACTION
-  // ============================================
-  
-  // Look for "Applied for ILR Route" or similar patterns
-  const routePatterns = [
-    // Exact field matches
-    /(?:applied\s+for\s+)?ilr\s+route\s*[:\-]?\s*(.+)/i,
-    /route\s*[:\-]?\s*(set\s*\([omf]\)|tier\s*\d|spouse|partner|10.?year|5.?year|long.?res)/i,
-    /application\s+type\s*[:\-]?\s*(.+)/i,
-  ];
-
-  for (const pattern of routePatterns) {
-    const match = content.match(pattern);
-    if (match?.[1]) {
-      const routeRaw = match[1].trim().toLowerCase();
-      
-      // Normalize route names
-      if (routeRaw.includes('set(o)') || routeRaw.includes('set (o)')) {
-        result.applicationRoute = 'SET(O)';
-        result.applicationType = 'ILR';
-      } else if (routeRaw.includes('set(m)') || routeRaw.includes('set (m)')) {
-        result.applicationRoute = 'SET(M)';
-        result.applicationType = 'ILR';
-      } else if (routeRaw.includes('set(f)') || routeRaw.includes('set (f)')) {
-        result.applicationRoute = 'SET(F)';
-        result.applicationType = 'ILR';
-      } else if (routeRaw.includes('2x3') || routeRaw.includes('dlr')) {
-        result.applicationRoute = '10-year';
-        result.applicationType = 'ILR';
-      } else if (routeRaw.includes('tier 2') || routeRaw.includes('tier2')) {
-        result.applicationRoute = 'Tier 2';
-        result.applicationType = 'ILR';
-      } else if (routeRaw.includes('spouse')) {
-        result.applicationRoute = 'Spouse';
-        result.applicationType = 'ILR';
-      } else if (routeRaw.includes('dependent') || routeRaw.includes('dependant')) {
-        result.applicationRoute = 'Dependant';
-        result.applicationType = 'ILR';
-      } else {
-        result.applicationRoute = match[1].trim().slice(0, 50); // Cap length
-        result.applicationType = 'ILR';
-      }
-      confidenceScore += 2;
-      break;
-    }
+  // ============ ROUTE / TYPE ============
+  const route = extractRoute(content);
+  if (route) {
+    result.applicationRoute = route.route;
+    result.applicationType = route.type;
+    score += 2;
+  } else if (/\b(ilr|indefinite\s+leave\s+to\s+remain)\b/i.test(content)) {
+    result.applicationType = 'ILR';
+    score += 0.5;
+  } else if (/\b(flr|further\s+leave)\b/i.test(content)) {
+    result.applicationType = 'FLR';
+    score += 0.5;
+  } else if (/\bnaturali[sz]ation\b/i.test(content)) {
+    result.applicationType = 'Naturalization';
+    score += 0.5;
   }
 
-  // ============================================
-  // DATE EXTRACTION
-  // ============================================
-  
-  // Application date patterns
-  const applicationDatePatterns = [
-    /(?:date\s+)?application\s+sent\s*[:\-]?\s*(\d{1,2}[\s\/\-\.]+\w+[\s\/\-\.]+\d{2,4}|\d{1,2}[\s\/\-\.]+\d{1,2}[\s\/\-\.]+\d{2,4})/i,
-    /(?:date\s+)?applied\s*[:\-]?\s*(\d{1,2}[\s\/\-\.]+\w+[\s\/\-\.]+\d{2,4}|\d{1,2}[\s\/\-\.]+\d{1,2}[\s\/\-\.]+\d{2,4})/i,
-    /submitted\s*(?:on)?\s*[:\-]?\s*(\d{1,2}[\s\/\-\.]+\w+[\s\/\-\.]+\d{2,4}|\d{1,2}[\s\/\-\.]+\d{1,2}[\s\/\-\.]+\d{2,4})/i,
-    /application\s+date\s*[:\-]?\s*(\d{1,2}[\s\/\-\.]+\w+[\s\/\-\.]+\d{2,4}|\d{1,2}[\s\/\-\.]+\d{1,2}[\s\/\-\.]+\d{2,4})/i,
-  ];
-
-  for (const pattern of applicationDatePatterns) {
-    const match = content.match(pattern);
-    if (match?.[1]) {
-      const parsed = parseFlexibleDate(match[1]);
-      if (parsed) {
-        result.applicationDate = parsed;
-        confidenceScore += 1.5;
-        break;
-      }
-    }
+  // ============ SERVICE TIER ============
+  const serviceTier = extractServiceTier(content);
+  if (serviceTier) {
+    result.serviceTier = serviceTier;
+    score += 1;
   }
 
-  // Biometrics date patterns
-  const biometricsPatterns = [
-    /biometrics?\s+(?:date|enrolled|done|completed)\s*[:\-]?\s*(\d{1,2}[\s\/\-\.]+\w+[\s\/\-\.]+\d{2,4}|\d{1,2}[\s\/\-\.]+\d{1,2}[\s\/\-\.]+\d{2,4})/i,
-    /(?:date\s+)?biometrics?\s*[:\-]?\s*(\d{1,2}[\s\/\-\.]+\w+[\s\/\-\.]+\d{2,4}|\d{1,2}[\s\/\-\.]+\d{1,2}[\s\/\-\.]+\d{2,4})/i,
-    /bio(?:metrics?)?\s+letter\s+received\s*[:\-]?\s*(\d{1,2}[\s\/\-\.]+\w+[\s\/\-\.]+\d{2,4}|\d{1,2}[\s\/\-\.]+\d{1,2}[\s\/\-\.]+\d{2,4})/i,
-  ];
-
-  for (const pattern of biometricsPatterns) {
-    const match = content.match(pattern);
-    if (match?.[1]) {
-      const parsed = parseFlexibleDate(match[1]);
-      if (parsed) {
-        result.biometricsDate = parsed;
-        confidenceScore += 0.5;
-        break;
-      }
-    }
+  // ============ DATES ============
+  const applicationDate = extractDateField(content, APPLICATION_PATTERNS);
+  if (applicationDate) {
+    result.applicationDate = applicationDate;
+    events.push({ type: 'applied', date: applicationDate, confidence: 0.95 });
+    score += 1.5;
   }
 
-  // Decision date patterns
-  const decisionPatterns = [
-    /(?:approval|decision|approved?)\s*(?:\/\s*refusal)?\s*(?:received|date|email)?\s*[:\-]?\s*(\d{1,2}[\s\/\-\.]+\w+[\s\/\-\.]+\d{2,4}|\d{1,2}[\s\/\-\.]+\d{1,2}[\s\/\-\.]+\d{2,4})/i,
-    /(?:refusal|refused|rejected)\s*(?:received|date)?\s*[:\-]?\s*(\d{1,2}[\s\/\-\.]+\w+[\s\/\-\.]+\d{2,4}|\d{1,2}[\s\/\-\.]+\d{1,2}[\s\/\-\.]+\d{2,4})/i,
-    /brp\s+(?:card\s+)?received\s*[:\-]?\s*(\d{1,2}[\s\/\-\.]+\w+[\s\/\-\.]+\d{2,4}|\d{1,2}[\s\/\-\.]+\d{1,2}[\s\/\-\.]+\d{2,4})/i,
-    /e-?visa\s+(?:status\s+)?(?:changed|updated)\s*[:\-]?\s*(\d{1,2}[\s\/\-\.]+\w+[\s\/\-\.]+\d{2,4}|\d{1,2}[\s\/\-\.]+\d{1,2}[\s\/\-\.]+\d{2,4})/i,
-    /settled\s*[:\-]?\s*(\d{1,2}[\s\/\-\.]+\w+[\s\/\-\.]+\d{2,4}|\d{1,2}[\s\/\-\.]+\d{1,2}[\s\/\-\.]+\d{2,4})/i,
-  ];
-
-  for (const pattern of decisionPatterns) {
-    const match = content.match(pattern);
-    if (match?.[1]) {
-      const parsed = parseFlexibleDate(match[1]);
-      if (parsed) {
-        result.decisionDate = parsed;
-        confidenceScore += 1.5;
-        break;
-      }
-    }
+  const biometricsResult = extractBiometricsDateAndLocation(content);
+  if (biometricsResult.date) {
+    result.biometricsDate = biometricsResult.date;
+    events.push({ type: 'biometrics', date: biometricsResult.date, confidence: 0.9 });
+    score += 1;
+  }
+  if (biometricsResult.location) {
+    result.biometricsLocation = biometricsResult.location;
+    score += 0.5;
   }
 
-  // Calculate waiting days if we have both dates
+  const acknowledgementDate = extractDateField(content, ACKNOWLEDGEMENT_PATTERNS);
+  if (acknowledgementDate) {
+    events.push({ type: 'acknowledgement', date: acknowledgementDate, confidence: 0.85 });
+    score += 0.25;
+  }
+
+  const docsRequestedDate = extractDateField(content, DOCS_REQUESTED_PATTERNS);
+  if (docsRequestedDate) {
+    result.docsRequestedDate = docsRequestedDate;
+    events.push({ type: 'docs_requested', date: docsRequestedDate, confidence: 0.85 });
+    score += 0.5;
+  }
+
+  const docsSubmittedDate = extractDateField(content, DOCS_SUBMITTED_PATTERNS);
+  if (docsSubmittedDate) {
+    result.docsSubmittedDate = docsSubmittedDate;
+    events.push({ type: 'docs_submitted', date: docsSubmittedDate, confidence: 0.8 });
+    score += 0.25;
+  }
+
+  const decisionDate = extractDateField(content, DECISION_PATTERNS);
+  if (decisionDate) {
+    result.decisionDate = decisionDate;
+    events.push({ type: 'decision', date: decisionDate, confidence: 0.95 });
+    score += 1.5;
+  }
+
+  // ============ WAITING DAYS (derived) ============
   if (result.applicationDate && result.decisionDate) {
     const diffMs = result.decisionDate.getTime() - result.applicationDate.getTime();
     const diffDays = Math.round(diffMs / (1000 * 60 * 60 * 24));
     if (diffDays > 0 && diffDays < 1000) {
       result.waitingDays = diffDays;
-      confidenceScore += 2;
+      score += 1.5;
     } else {
-      notes.push('Calculated waiting days seem invalid');
+      notes.push('Computed waiting days outside reasonable range; ignoring.');
     }
   }
 
-  // ============================================
-  // OUTCOME EXTRACTION
-  // ============================================
-  
-  // Look for explicit outcome mentions
-  // Be careful about "Approval/Refusal Received" which is just a field label
-  
-  // Check for BRP received first - this is a strong indicator of approval
-  const hasBrpReceived = /brp\s+(?:card\s+)?received\s*[:\-]?\s*\d/i.test(content);
-  const hasEvisaSettled = /e-?visa.*settled/i.test(content);
-  const hasApprovalEmail = /approval\s+email\s*[:\-]?\s*\d/i.test(content);
-  
-  // Check for refusal (but not just "Approval/Refusal" label)
-  const hasRefusal = /\b(refused|rejected|denied|unsuccessful)\b/i.test(content) ||
-    /refusal\s+received\s*[:\-]?\s*\d/i.test(content);
-  
-  // Check for explicit approval words
-  const hasApproval = /\b(approved!?|granted!?|successful!?)\b/i.test(content) ||
-    /\bgot\s+my\s+ilr\b/i.test(content) ||
-    /\bilr\s+granted\b/i.test(content);
-  
-  // Check for pending status
-  const isPending = /\b(still\s+waiting|awaiting\s+decision|no\s+decision\s+yet)\b/i.test(content);
-  
-  // Determine outcome with priority
-  if (hasBrpReceived || hasEvisaSettled || hasApprovalEmail || hasApproval) {
-    result.outcome = 'approved';
-    confidenceScore += 1;
-  } else if (hasRefusal) {
-    result.outcome = 'rejected';
-    confidenceScore += 1;
-  } else if (isPending) {
-    result.outcome = 'pending';
-    confidenceScore += 0.5;
-  }
+  // ============ OUTCOME ============
+  result.outcome = inferOutcome(content, !!result.decisionDate);
+  if (result.outcome === 'approved' || result.outcome === 'rejected') score += 1;
+  else if (result.outcome === 'pending') score += 0.25;
 
-  // ============================================
-  // SERVICE CENTER EXTRACTION
-  // ============================================
-  
-  const centerPatterns = [
-    { pattern: /sheffield/i, center: 'Sheffield' },
-    { pattern: /liverpool/i, center: 'Liverpool' },
-    { pattern: /croydon/i, center: 'Croydon' },
-    { pattern: /cardiff/i, center: 'Cardiff' },
-    { pattern: /belfast/i, center: 'Belfast' },
-    { pattern: /glasgow/i, center: 'Glasgow' },
-    { pattern: /ukvcas/i, center: 'UKVCAS' },
-  ];
+  // isPending denormalized: true if outcome is pending OR we have an application
+  // date but no decision date yet.
+  result.isPending =
+    result.outcome === 'pending' ||
+    (!!result.applicationDate && !result.decisionDate);
 
-  for (const { pattern, center } of centerPatterns) {
-    if (pattern.test(content)) {
-      result.serviceCenter = center;
-      confidenceScore += 0.5;
-      break;
-    }
-  }
-
-  // ============================================
-  // APPLICANT NATIONALITY / LOCATION
-  // ============================================
-  
-  // Use the forum profile flag (most reliable source)
+  // ============ NATIONALITY ============
   if (authorNationality) {
-    result.applicantLocation = authorNationality;
-    confidenceScore += 0.5;
-  }
-
-  // ============================================
-  // APPLICATION TYPE/ROUTE DETECTION (if not already set)
-  // ============================================
-  
-  // Try to extract route if not already set - look for standalone mentions
-  if (!result.applicationRoute) {
-    // Check for Set(O), Set(M), Set(F) anywhere in the text
-    if (/\bset\s*\(?o\)?/i.test(content)) {
-      result.applicationRoute = 'SET(O)';
-      result.applicationType = 'ILR';
-      confidenceScore += 1;
-    } else if (/\bset\s*\(?m\)?/i.test(content)) {
-      result.applicationRoute = 'SET(M)';
-      result.applicationType = 'ILR';
-      confidenceScore += 1;
-    } else if (/\bset\s*\(?f\)?/i.test(content)) {
-      result.applicationRoute = 'SET(F)';
-      result.applicationType = 'ILR';
-      confidenceScore += 1;
-    } else if (/\b10[\s\-]?year/i.test(content)) {
-      result.applicationRoute = '10-year';
-      result.applicationType = 'ILR';
-      confidenceScore += 0.5;
-    }
-  }
-  
-  if (!result.applicationType) {
-    if (/\b(ilr|indefinite\s+leave\s+to\s+remain)\b/i.test(content)) {
-      result.applicationType = 'ILR';
-      confidenceScore += 0.5;
-    } else if (/\b(flr|further\s+leave)\b/i.test(content)) {
-      result.applicationType = 'FLR';
-      confidenceScore += 0.5;
-    } else if (/\bnaturali[sz]ation\b/i.test(content)) {
-      result.applicationType = 'Naturalization';
-      confidenceScore += 0.5;
+    result.applicantNationality = authorNationality;
+    const normalized = normalizeNationality(authorNationality);
+    if (normalized) {
+      result.applicantNationalityCode = normalized.code;
+      score += 0.5;
+    } else {
+      notes.push(`Unrecognized nationality: "${authorNationality}"`);
     }
   }
 
-  // ============================================
-  // ADDITIONAL CONTEXT
-  // ============================================
-  
-  // Check for standard/premium service
-  if (/\bstandard\b/i.test(content)) {
-    notes.push('Standard service');
-  }
-  if (/\bpremium\b/i.test(content)) {
-    notes.push('Premium service');
-  }
-  if (/\bsuper\s*priority\b/i.test(content)) {
-    notes.push('Super priority service');
-  }
-  if (/\bpriority\b/i.test(content)) {
-    notes.push('Priority service');
+  // ============ FINALIZE ============
+  // Sort events chronologically and dedupe by (type, date).
+  result.events = dedupeAndSortEvents(events);
+
+  result.confidence = Math.min(score / maxScore, 1);
+
+  if (result.confidence > 0 && result.confidence < 0.4) {
+    notes.push('Low confidence extraction — manual review recommended');
   }
 
-  // ============================================
-  // FINAL CONFIDENCE SCORE
-  // ============================================
-  
-  result.confidence = Math.min(confidenceScore / maxScore, 1);
-  
   if (notes.length > 0) {
     result.extractionNotes = notes.join('; ');
-  }
-
-  // Add note if confidence is low but we found something
-  if (result.confidence > 0 && result.confidence < 0.4) {
-    result.extractionNotes = (result.extractionNotes ? result.extractionNotes + '; ' : '') + 
-      'Low confidence extraction - manual review recommended';
   }
 
   return result;
 }
 
-/**
- * Parse various date formats commonly used in forum posts
- * 
- * Handles:
- * - DD/MM/YYYY, DD-MM-YYYY, DD.MM.YYYY
- * - D Month YYYY, DD Month YYYY
- * - Month DD, YYYY
- */
-function parseFlexibleDate(dateStr: string): Date | undefined {
-  const str = dateStr.trim();
+// ============================================================================
+// ROUTE EXTRACTION
+// ============================================================================
 
-  // Try DD/MM/YYYY or DD-MM-YYYY or DD.MM.YYYY
-  const numericMatch = str.match(/(\d{1,2})[\s\/\-\.](\d{1,2})[\s\/\-\.](\d{2,4})/);
+interface RouteMatch {
+  route: string;
+  type: string;
+}
+
+function extractRoute(content: string): RouteMatch | undefined {
+  // First try the explicit "Applied for ILR Route : ..." line and look at
+  // the values in parens / after the SET label, since that's where the
+  // sub-route hides (e.g. "Set (O) (Skilled Worker)").
+  const fieldMatch = content.match(/applied\s+for\s+ilr\s+route\s*[:\-]?\s*([^\n\r]+)/i);
+  const fieldValue = fieldMatch?.[1] ?? '';
+  const haystack = (fieldValue + ' ' + content).toLowerCase();
+
+  // Sub-route detection (more specific first).
+  if (/\bbn\s*\(?o\)?|british\s+national\s*\(\s*overseas\s*\)/i.test(haystack)) {
+    return { route: 'BN(O)', type: 'ILR' };
+  }
+  if (/\bglobal\s+talent|\bgtv\b/i.test(haystack)) {
+    return { route: 'Global Talent', type: 'ILR' };
+  }
+  if (/\bskilled\s+worker\b/i.test(haystack)) {
+    return { route: 'Skilled Worker', type: 'ILR' };
+  }
+  if (/\btier\s*1\s+entrepreneur/i.test(haystack)) {
+    return { route: 'Tier 1 Entrepreneur', type: 'ILR' };
+  }
+  if (/\btier\s*2\b/i.test(haystack)) {
+    return { route: 'Tier 2', type: 'ILR' };
+  }
+  if (/\bset\s*\(?\s*m\s*\)?|british\s+spouse|spouse\s+of\s+a?\s*british/i.test(haystack)) {
+    return { route: 'SET(M)', type: 'ILR' };
+  }
+  if (/\bset\s*\(?\s*f\s*\)?/i.test(haystack)) {
+    return { route: 'SET(F)', type: 'ILR' };
+  }
+  // 10-year long residence is more specific than the generic SET(O) form,
+  // so it wins when the post mentions both (e.g. "Set(O) - 10 year route").
+  if (/\b10[\s\-]?year|long.?residence|2\s*x\s*3|\bdlr\b/i.test(haystack)) {
+    return { route: '10-year', type: 'ILR' };
+  }
+  if (/\bset\s*\(?\s*[o0]\s*\)?/i.test(haystack)) {
+    // SET(O) is a catch-all for work routes; we already checked for sub-routes
+    // above (Skilled Worker, GTV, 10-year, etc.) so anything reaching here is generic.
+    return { route: 'SET(O)', type: 'ILR' };
+  }
+  if (/\b(dependent|dependant)\b/i.test(haystack)) {
+    return { route: 'Dependant', type: 'ILR' };
+  }
+
+  return undefined;
+}
+
+// ============================================================================
+// SERVICE TIER EXTRACTION
+// ============================================================================
+
+function extractServiceTier(content: string): ServiceTier | undefined {
+  // Try the explicit field first — most reliable.
+  const field = content.match(/application\s+type\s*[:\-]?\s*([^\n\r]+)/i)?.[1];
+  if (field) {
+    const tier = matchServiceTierString(field);
+    if (tier) return tier;
+  }
+
+  // Fallback: search whole content.
+  return matchServiceTierString(content);
+}
+
+function matchServiceTierString(s: string): ServiceTier | undefined {
+  const lower = s.toLowerCase();
+
+  // Order matters: super-priority must come before priority.
+  if (/\bsuper[\s\-]*priority\b/.test(lower)) return 'super_priority';
+  if (/\b(priority|5[\s\-]?day)\b/.test(lower)) return 'priority';
+  if (/\bstandard\b/.test(lower)) return 'standard';
+
+  return undefined;
+}
+
+// ============================================================================
+// DATE FIELD EXTRACTION
+// ============================================================================
+
+// Matches numeric (DD/MM/YYYY etc.) and textual ("3 March 2026", "March 3, 2026") dates.
+// Captured group is the whole date substring.
+const DATE_REGEX_FRAGMENT =
+  String.raw`(\d{1,2}\s+\w+\s+\d{2,4}|\w+\s+\d{1,2},?\s+\d{4}|\d{1,2}[\s\/\-\.]+\d{1,2}[\s\/\-\.]+\d{2,4})`;
+
+function buildPatterns(prefixes: string[]): RegExp[] {
+  return prefixes.map(
+    (prefix) => new RegExp(prefix + String.raw`\s*[:\-]?\s*` + DATE_REGEX_FRAGMENT, 'i')
+  );
+}
+
+const APPLICATION_PATTERNS = buildPatterns([
+  String.raw`(?:date\s+)?application\s+sent`,
+  String.raw`application\s+submitted\s+online`,
+  String.raw`application\s+date`,
+  String.raw`(?:date\s+)?applied`,
+  String.raw`submitted(?:\s+on)?`,
+]);
+
+const ACKNOWLEDGEMENT_PATTERNS = buildPatterns([
+  String.raw`acknowledgement\s+email(?:\s+from\s+ukvi)?`,
+  String.raw`(?:application\s+)?receipt\s+confirmation\s+email`,
+  String.raw`biometrics?\s+confirmation\s+email`,
+]);
+
+const DOCS_REQUESTED_PATTERNS = buildPatterns([
+  String.raw`extra\s+documents?\s+requested(?:\s+on)?`,
+  String.raw`additional\s+documents?\s+requested(?:\s+on)?`,
+  String.raw`(?:more\s+)?documents?\s+requested(?:\s+on)?`,
+  String.raw`ho\s+exceptional\s+circumstances\s+email(?:\s+on)?`,
+  String.raw`further\s+information\s+request(?:ed)?(?:\s+on)?`,
+]);
+
+const DOCS_SUBMITTED_PATTERNS = buildPatterns([
+  String.raw`follow\s+up\s+email\s+sent`,
+  String.raw`additional\s+documents?\s+(?:submitted|sent|provided)(?:\s+on)?`,
+  String.raw`extra\s+documents?\s+(?:submitted|sent|provided)(?:\s+on)?`,
+  String.raw`response\s+sent(?:\s+on)?`,
+]);
+
+// Decision is the trickiest because the forum has many phrasings.
+// Strict order: a single "approved" / "BRP received" line is enough.
+const DECISION_PATTERNS = buildPatterns([
+  String.raw`approval\s+(?:email|received|date)`,
+  String.raw`approval[\/\s]+refusal\s+received`,
+  String.raw`(?:refusal|refused|rejected|denied)\s+(?:email|received|date|on)?`,
+  String.raw`decision\s+(?:received|date|email|made|on)`,
+  String.raw`brp\s+(?:card\s+)?received`,
+  String.raw`e-?visa\s+(?:status\s+)?(?:changed|updated)\s+to\s+settled\s+on`,
+]);
+
+function extractDateField(content: string, patterns: RegExp[]): Date | undefined {
+  for (const pattern of patterns) {
+    const match = content.match(pattern);
+    if (match?.[1]) {
+      const parsed = parseFlexibleDate(match[1]);
+      if (parsed) return parsed;
+    }
+  }
+  return undefined;
+}
+
+// ============================================================================
+// BIOMETRICS (date + city in parens)
+// ============================================================================
+
+interface BiometricsResult {
+  date?: Date;
+  location?: string;
+}
+
+function extractBiometricsDateAndLocation(content: string): BiometricsResult {
+  // Look for the biometrics line first to capture optional location in parens.
+  // Examples seen in the wild:
+  //   Biometrics appointment: 3 March 2026 (Nottingham) - Free Appointment
+  //   Biometrics Date: 5 Feb 2026 (Anytime walk in appointment - £175 fees paid)
+  //   Biometrics Confirmation Email:5 Feb 2026
+  //   Date Biometrics Enrolled :20/01/2017
+  //
+  // The "Confirmation Email" line is acknowledgement, not the appointment, so
+  // we deliberately exclude it here — it's caught separately in
+  // ACKNOWLEDGEMENT_PATTERNS.
+  const linePatterns = [
+    new RegExp(
+      String.raw`biometrics?\s+appointment\s*[:\-]?\s*` +
+        DATE_REGEX_FRAGMENT +
+        String.raw`(?:\s*\(([^)]+)\))?`,
+      'i'
+    ),
+    new RegExp(
+      String.raw`biometrics?\s+(?:date|enrolled|done|completed)\s*[:\-]?\s*` +
+        DATE_REGEX_FRAGMENT +
+        String.raw`(?:\s*\(([^)]+)\))?`,
+      'i'
+    ),
+    new RegExp(
+      String.raw`bio(?:metrics?)?\s+letter\s+received\s*[:\-]?\s*` + DATE_REGEX_FRAGMENT,
+      'i'
+    ),
+    new RegExp(
+      String.raw`(?:date\s+)?biometrics?\s*[:\-]?\s*` +
+        DATE_REGEX_FRAGMENT +
+        String.raw`(?:\s*\(([^)]+)\))?`,
+      'i'
+    ),
+  ];
+
+  for (const pattern of linePatterns) {
+    const match = content.match(pattern);
+    if (match?.[1]) {
+      const parsed = parseFlexibleDate(match[1]);
+      if (parsed) {
+        const location = match[2] ? cleanBiometricsLocation(match[2]) : undefined;
+        return { date: parsed, location };
+      }
+    }
+  }
+
+  return {};
+}
+
+/**
+ * The parens after a biometrics line frequently contain city, but sometimes
+ * they contain noise like "Anytime walk in appointment - £175 fees paid".
+ * We only return a value if the parenthetical looks like a place name —
+ * mostly letters, a couple of spaces, optionally hyphens, no digits or £
+ * symbols. Otherwise we drop it.
+ */
+function cleanBiometricsLocation(raw: string): string | undefined {
+  const trimmed = raw.trim();
+
+  // Reject content that contains digits, currency, or obvious noise tokens.
+  if (/[£$€]|\d/.test(trimmed)) return undefined;
+  if (/\b(walk|free|paid|fee|fees|slot|slots|appointment|booked|cancel|reschedule)\b/i.test(trimmed))
+    return undefined;
+
+  // Cap length and require at least 2 letters.
+  if (trimmed.length < 2 || trimmed.length > 60) return undefined;
+  if (!/[A-Za-z]{2,}/.test(trimmed)) return undefined;
+
+  // Title-case the first letter of each word.
+  return trimmed
+    .split(/\s+/)
+    .map((w) => (w.length === 0 ? w : w[0]!.toUpperCase() + w.slice(1).toLowerCase()))
+    .join(' ');
+}
+
+// ============================================================================
+// OUTCOME INFERENCE
+// ============================================================================
+
+function inferOutcome(content: string, hasDecisionDate: boolean): 'approved' | 'rejected' | 'pending' | 'unknown' {
+  const text = content;
+
+  // Strong approval signals — these specifically indicate a decided positive case.
+  const strongApproval =
+    /\bilr\s+granted\b/i.test(text) ||
+    /\bgranted\s+ilr\b/i.test(text) ||
+    /\bgot\s+my\s+ilr\b/i.test(text) ||
+    /\b(approved!|granted!|successful!)\b/i.test(text) ||
+    /\bapproval\s+email\s*[:\-]?\s*\d/i.test(text) ||
+    /\bapproval\s+received\s*[:\-]?\s*\d/i.test(text) ||
+    /\bbrp\s+(?:card\s+)?received\s*[:\-]?\s*\d/i.test(text) ||
+    /\be-?visa\s+status\s+changed\s+to\s+settled/i.test(text);
+
+  // Refusal signals — careful not to match the field label "Approval/Refusal Received".
+  // We accept either an unambiguous verb ("refused", "rejected", "denied",
+  // "unsuccessful") OR the noun "refusal" when it's clearly the outcome
+  // ("Refusal received <date>").
+  const refusalAsNounWithDate = /\brefusal\s+received\s*[:\-]?\s*\d/i.test(text);
+  const refusedVerbs =
+    /\b(refused|rejected|denied|unsuccessful)\b/i.test(text) &&
+    !/approval\s*\/\s*refusal/i.test(text);
+  const refused = refusalAsNounWithDate || refusedVerbs;
+
+  const pending =
+    /\b(still\s+waiting|awaiting\s+decision|no\s+decision\s+yet|no\s+update|in\s+progress)\b/i.test(text);
+
+  if (strongApproval) return 'approved';
+  if (refused) return 'rejected';
+  if (pending) return 'pending';
+
+  // If we have a decision date but no clear approve/reject signal, default to approved.
+  // The vast majority of forum-posted "decision came on date X" with no negative
+  // language is in fact an approval; calling it "unknown" silently drops too many.
+  if (hasDecisionDate) return 'approved';
+
+  return 'unknown';
+}
+
+// ============================================================================
+// EVENT DEDUPE / SORT
+// ============================================================================
+
+function dedupeAndSortEvents(events: ExtractedEvent[]): ExtractedEvent[] {
+  const seen = new Set<string>();
+  const out: ExtractedEvent[] = [];
+  for (const e of events) {
+    const key = `${e.type}|${e.date.toISOString()}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(e);
+  }
+  return out.sort((a, b) => a.date.getTime() - b.date.getTime());
+}
+
+// ============================================================================
+// FLEXIBLE DATE PARSING (UTC, UK-first DD/MM)
+// ============================================================================
+
+const MONTH_NAMES: Record<string, number> = {
+  jan: 0, january: 0,
+  feb: 1, february: 1,
+  mar: 2, march: 2,
+  apr: 3, april: 3,
+  may: 4,
+  jun: 5, june: 5,
+  jul: 6, july: 6,
+  aug: 7, august: 7,
+  sep: 8, sept: 8, september: 8,
+  oct: 9, october: 9,
+  nov: 10, november: 10,
+  dec: 11, december: 11,
+};
+
+/**
+ * Parse forum date strings into UTC-midnight Date objects.
+ *
+ * Bias: UK-first ordering. "03/04/2025" is interpreted as 3 April 2025, not
+ * March 4. We disambiguate using the day field exceeding 12 (e.g. "13/04/2025"
+ * is unambiguously day=13). The unambiguous cases give us strong UK signal,
+ * and forum templates ("Date application sent : DD/MM/YYYY") consistently use
+ * UK format.
+ *
+ * Returns undefined for clearly invalid or out-of-range dates.
+ */
+export function parseFlexibleDate(dateStr: string): Date | undefined {
+  const str = dateStr.trim();
+  if (!str) return undefined;
+
+  // 1. DD/MM/YYYY, DD-MM-YYYY, DD.MM.YYYY (UK format, default).
+  const numericMatch = str.match(/^(\d{1,2})[\s\/\-\.](\d{1,2})[\s\/\-\.](\d{2,4})$/);
   if (numericMatch) {
-    const [, dayStr, monthStr, yearStr] = numericMatch;
-    const day = parseInt(dayStr!, 10);
-    const month = parseInt(monthStr!, 10) - 1; // 0-indexed
-    let year = parseInt(yearStr!, 10);
+    const day = parseInt(numericMatch[1]!, 10);
+    const month = parseInt(numericMatch[2]!, 10) - 1;
+    let year = parseInt(numericMatch[3]!, 10);
     if (year < 100) year += 2000;
 
-    // Validate UK date format (DD/MM/YYYY)
     if (day >= 1 && day <= 31 && month >= 0 && month <= 11) {
-      const date = new Date(year, month, day);
+      const date = new Date(Date.UTC(year, month, day));
       if (!isNaN(date.getTime()) && isReasonableDate(date)) {
         return date;
       }
     }
   }
 
-  // Try D(D) Month YYYY
-  const monthNames: Record<string, number> = {
-    jan: 0, january: 0,
-    feb: 1, february: 1,
-    mar: 2, march: 2,
-    apr: 3, april: 3,
-    may: 4,
-    jun: 5, june: 5,
-    jul: 6, july: 6,
-    aug: 7, august: 7,
-    sep: 8, sept: 8, september: 8,
-    oct: 9, october: 9,
-    nov: 10, november: 10,
-    dec: 11, december: 11,
-  };
-
-  const textDateMatch = str.match(/(\d{1,2})\s+(\w+)\s+(\d{4})/i);
-  if (textDateMatch) {
-    const [, dayStr, monthStr, yearStr] = textDateMatch;
-    const day = parseInt(dayStr!, 10);
-    const monthKey = monthStr!.toLowerCase();
-    const month = monthNames[monthKey] ?? monthNames[monthKey.slice(0, 3)];
-    const year = parseInt(yearStr!, 10);
+  // 2. "D Month YYYY" — UK textual format, e.g. "3 March 2026".
+  const ukTextMatch = str.match(/^(\d{1,2})\s+(\w+)\s+(\d{4})$/i);
+  if (ukTextMatch) {
+    const day = parseInt(ukTextMatch[1]!, 10);
+    const monthKey = ukTextMatch[2]!.toLowerCase();
+    const month = MONTH_NAMES[monthKey] ?? MONTH_NAMES[monthKey.slice(0, 3)];
+    const year = parseInt(ukTextMatch[3]!, 10);
 
     if (month !== undefined && day >= 1 && day <= 31) {
-      const date = new Date(year, month, day);
+      const date = new Date(Date.UTC(year, month, day));
       if (!isNaN(date.getTime()) && isReasonableDate(date)) {
         return date;
       }
     }
   }
 
-  // Try Month DD, YYYY (US format, sometimes used)
-  const usDateMatch = str.match(/(\w+)\s+(\d{1,2}),?\s+(\d{4})/i);
-  if (usDateMatch) {
-    const [, monthStr, dayStr, yearStr] = usDateMatch;
-    const monthKey = monthStr!.toLowerCase();
-    const month = monthNames[monthKey] ?? monthNames[monthKey.slice(0, 3)];
-    const day = parseInt(dayStr!, 10);
-    const year = parseInt(yearStr!, 10);
+  // 3. "Month D, YYYY" — US textual format, occasionally used.
+  const usTextMatch = str.match(/^(\w+)\s+(\d{1,2}),?\s+(\d{4})$/i);
+  if (usTextMatch) {
+    const monthKey = usTextMatch[1]!.toLowerCase();
+    const month = MONTH_NAMES[monthKey] ?? MONTH_NAMES[monthKey.slice(0, 3)];
+    const day = parseInt(usTextMatch[2]!, 10);
+    const year = parseInt(usTextMatch[3]!, 10);
 
     if (month !== undefined && day >= 1 && day <= 31) {
-      const date = new Date(year, month, day);
+      const date = new Date(Date.UTC(year, month, day));
       if (!isNaN(date.getTime()) && isReasonableDate(date)) {
         return date;
       }
@@ -383,13 +546,11 @@ function parseFlexibleDate(dateStr: string): Date | undefined {
   return undefined;
 }
 
-/**
- * Check if date is reasonable (not too far in past or future)
- */
 function isReasonableDate(date: Date): boolean {
   const now = new Date();
-  const minDate = new Date(2010, 0, 1); // ILR data before 2010 unlikely useful
-  const maxDate = new Date(now.getTime() + 30 * 24 * 60 * 60 * 1000); // 30 days in future
-  
+  // ILR data before 2010 is unlikely useful; cases beyond ~30 days in the future
+  // are almost certainly typos.
+  const minDate = new Date(Date.UTC(2010, 0, 1));
+  const maxDate = new Date(now.getTime() + 30 * 24 * 60 * 60 * 1000);
   return date >= minDate && date <= maxDate;
 }

@@ -89,34 +89,57 @@ model Post {
 model ExtractedCase {
   id                String   @id @default(cuid())
   postId            String   @unique @map("post_id")
-  
-  // ILR-specific fields
+
+  // ============ ROUTE / TYPE ============
   applicationType   String?  @map("application_type") // e.g., "ILR", "FLR(M)", "Naturalization"
-  applicationRoute  String?  @map("application_route") // e.g., "10-year", "5-year", "spouse"
-  
-  // Timeline data (in days, nullable if not extractable)
+  applicationRoute  String?  @map("application_route") // e.g., "SET(O)", "10-year", "BN(O)", "Skilled Worker"
+  // Service tier — first-class so we can stratify or filter the cohort.
+  // "standard" | "priority" | "super_priority". NULL = unknown.
+  serviceTier       String?  @map("service_tier")
+
+  // ============ TIMELINE (snapshot view; CaseEvent has the full stream) ============
   applicationDate   DateTime? @map("application_date")
   biometricsDate    DateTime? @map("biometrics_date")
+  // First "more documents requested" event date (if any). Null if none.
+  docsRequestedDate DateTime? @map("docs_requested_date")
+  // Date the applicant submitted the additional docs / followed up.
+  docsSubmittedDate DateTime? @map("docs_submitted_date")
   decisionDate      DateTime? @map("decision_date")
-  waitingDays       Int?     @map("waiting_days") // Computed: decision - application
-  
-  // Location info
-  serviceCenter     String?  @map("service_center") // e.g., "Sheffield", "Liverpool"
-  applicantLocation String?  @map("applicant_location")
-  
-  // Outcome
-  outcome           String?  // "approved", "rejected", "pending", "unknown"
-  
-  // Extraction metadata
-  confidence        Float    @default(0) // 0-1 score
-  extractionNotes   String?  @map("extraction_notes") // Notes about partial/uncertain extractions
-  extractedAt       DateTime @default(now()) @map("extracted_at")
-  extractorVersion  String   @default("1.0") @map("extractor_version")
-  
-  createdAt         DateTime @default(now()) @map("created_at")
-  updatedAt         DateTime @updatedAt @map("updated_at")
+  // Computed: decisionDate - applicationDate (in days). Null while still pending.
+  waitingDays       Int?     @map("waiting_days")
 
-  post Post @relation(fields: [postId], references: [id], onDelete: Cascade)
+  // ============ LOCATION ============
+  // UKVCAS biometrics location (e.g., "Wandsworth", "Sheffield", "Nottingham").
+  // This is what the forum actually reports; NOT the Home Office decision center.
+  biometricsLocation String?  @map("biometrics_location")
+  // Home Office decision center (e.g., "Sheffield", "Liverpool", "Croydon").
+  // Rarely populated by the forum — present for forward compatibility.
+  decisionCenter     String?  @map("decision_center")
+
+  // ============ APPLICANT ============
+  // Free-form nationality string from the forum profile flag (e.g., "India", "Hong Kong (...)").
+  // This preserves the original signal.
+  applicantNationality     String?  @map("applicant_nationality")
+  // Normalized ISO-3166 alpha-2 code (e.g., "IN", "HK"). Backfilled from the lookup table.
+  applicantNationalityCode String?  @map("applicant_nationality_code")
+
+  // ============ OUTCOME ============
+  outcome   String?  // "approved" | "rejected" | "pending" | "unknown"
+  // Denormalized: true if outcome is "pending" OR (decisionDate is null AND applicationDate is set).
+  // Cached so survival queries can index instead of recomputing per row.
+  isPending Boolean  @default(false) @map("is_pending")
+
+  // ============ EXTRACTION METADATA ============
+  confidence       Float    @default(0) // 0-1 score
+  extractionNotes  String?  @map("extraction_notes")
+  extractedAt      DateTime @default(now()) @map("extracted_at")
+  extractorVersion String   @default("1.0") @map("extractor_version")
+
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  post   Post        @relation(fields: [postId], references: [id], onDelete: Cascade)
+  events CaseEvent[]
 
   @@index([applicationType])
   @@index([applicationRoute])
@@ -124,7 +147,39 @@ model ExtractedCase {
   @@index([decisionDate])
   @@index([outcome])
   @@index([confidence])
+  @@index([serviceTier])
+  @@index([biometricsLocation])
+  @@index([applicantNationalityCode])
+  @@index([isPending])
   @@map("extracted_cases")
+}
+
+// ============================================
+// CASE EVENTS (the milestone stream)
+// ============================================
+// One row per extracted milestone. The same post can produce multiple events.
+// Re-extraction wipes existing rows for the case and recreates them, so the
+// event set is always consistent with the latest extractor version.
+model CaseEvent {
+  id         String   @id @default(cuid())
+  caseId     String   @map("case_id")
+  // "applied" | "biometrics" | "acknowledgement"
+  // | "docs_requested" | "docs_submitted" | "decision"
+  type       String
+  eventDate  DateTime @map("event_date")
+  // Confidence in this specific event extraction (0..1).
+  confidence Float    @default(1.0)
+  createdAt  DateTime @default(now()) @map("created_at")
+
+  case ExtractedCase @relation(fields: [caseId], references: [id], onDelete: Cascade)
+
+  // Same case + type + date should not appear twice.
+  // This makes upserts during re-extraction safe.
+  @@unique([caseId, type, eventDate])
+  @@index([caseId])
+  @@index([type])
+  @@index([eventDate])
+  @@map("case_events")
 }
 
 // ============================================

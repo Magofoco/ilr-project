@@ -2,6 +2,10 @@
  * Shared utility functions
  */
 
+export { normalizeNationality } from './nationality.js';
+export { kaplanMeier, kmPercentile, kmDecidedByDayFraction, kmConditionalMedian } from './kaplan-meier.js';
+export type { KmResult, KmPoint, KmInput } from './kaplan-meier.js';
+
 export interface RetryOptions {
   /** Maximum number of attempts (default: 3) */
   maxAttempts?: number;

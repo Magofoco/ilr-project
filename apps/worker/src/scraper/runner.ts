@@ -1,8 +1,62 @@
 import { prisma, Prisma, type SourceForum } from '@ilr/db';
-import type { SourceAdapter, ScrapedPost, ScrapeProgress } from '@ilr/shared';
+import type { SourceAdapter, ScrapedPost, ScrapeProgress, ExtractionResult } from '@ilr/shared';
 import { retryWithBackoff } from '@ilr/shared';
 import { extractCaseData, EXTRACTOR_VERSION } from '../extraction/extractor.js';
 import { hashContent, delay, getJitter } from '../utils/helpers.js';
+
+/** Minimum confidence for an extracted case to be persisted. */
+const MIN_CONFIDENCE = 0.3;
+
+/**
+ * Build the `data` payload for ExtractedCase create/update from an
+ * ExtractionResult. Centralized so create + update + re-extraction stay in sync.
+ */
+function caseDataFromExtraction(extraction: ExtractionResult) {
+  return {
+    applicationType: extraction.applicationType,
+    applicationRoute: extraction.applicationRoute,
+    serviceTier: extraction.serviceTier,
+    applicationDate: extraction.applicationDate,
+    biometricsDate: extraction.biometricsDate,
+    docsRequestedDate: extraction.docsRequestedDate,
+    docsSubmittedDate: extraction.docsSubmittedDate,
+    decisionDate: extraction.decisionDate,
+    waitingDays: extraction.waitingDays,
+    biometricsLocation: extraction.biometricsLocation,
+    decisionCenter: extraction.decisionCenter,
+    applicantNationality: extraction.applicantNationality,
+    applicantNationalityCode: extraction.applicantNationalityCode,
+    outcome: extraction.outcome,
+    isPending: extraction.isPending ?? false,
+    confidence: extraction.confidence,
+    extractionNotes: extraction.extractionNotes,
+    extractorVersion: EXTRACTOR_VERSION,
+  };
+}
+
+/**
+ * Replace the events for a case with a fresh set from the extractor.
+ * Idempotent: safe to call on re-extraction.
+ */
+async function syncCaseEvents(
+  tx: Prisma.TransactionClient,
+  caseId: string,
+  extraction: ExtractionResult
+): Promise<void> {
+  await tx.caseEvent.deleteMany({ where: { caseId } });
+
+  if (extraction.events.length === 0) return;
+
+  await tx.caseEvent.createMany({
+    data: extraction.events.map((e) => ({
+      caseId,
+      type: e.type,
+      eventDate: e.date,
+      confidence: e.confidence,
+    })),
+    skipDuplicates: true,
+  });
+}
 
 interface RunScraperOptions {
   source: SourceForum;
@@ -211,8 +265,8 @@ export async function runScraper(options: RunScraperOptions): Promise<void> {
             if (dryRun) {
               for (const post of pagePosts) {
                 const extraction = extractCaseData(post.content, post.authorNationality);
-                if (extraction.confidence > 0.3) {
-                  console.log(`    [DRY RUN] Would extract: ${extraction.applicationRoute || 'unknown route'} (${(extraction.confidence * 100).toFixed(0)}%)`);
+                if (extraction.confidence >= MIN_CONFIDENCE) {
+                  console.log(`    [DRY RUN] Would extract: ${extraction.applicationRoute || 'unknown route'} (${(extraction.confidence * 100).toFixed(0)}%, ${extraction.events.length} events)`);
                   stats.casesExtracted++;
                 }
                 stats.postsScraped++;
@@ -398,7 +452,6 @@ async function processPostsInBatches(
     
     await retryWithBackoff(
       () => prisma.$transaction(async (tx) => {
-        // Insert new posts
         await tx.post.createMany({
           data: batch.map((post) => ({
             threadId,
@@ -413,7 +466,6 @@ async function processPostsInBatches(
           skipDuplicates: true,
         });
 
-        // Get the created posts to extract cases
         const createdPosts = await tx.post.findMany({
           where: {
             threadId,
@@ -422,39 +474,27 @@ async function processPostsInBatches(
           select: { id: true, externalId: true, content: true },
         });
 
-        // Extract cases and prepare for batch insert
-        // Build nationality lookup from the original scraped batch
+        // Build nationality lookup from the original scraped batch (the post
+        // model doesn't store the same field directly).
         const nationalityMap = new Map(batch.map((p) => [p.externalId, p.authorNationality]));
-        const casesToCreate: Prisma.ExtractedCaseCreateManyInput[] = [];
-        
+
+        // We can't use createMany for cases because we need to also insert their
+        // events (one row per ExtractedCase). Use individual upserts in the same
+        // transaction so a partial failure rolls everything back.
         for (const dbPost of createdPosts) {
           const nationality = nationalityMap.get(dbPost.externalId);
           const extraction = extractCaseData(dbPost.content, nationality);
-          if (extraction.confidence > 0.3) {
-            casesToCreate.push({
-              postId: dbPost.id,
-              applicationType: extraction.applicationType,
-              applicationRoute: extraction.applicationRoute,
-              applicationDate: extraction.applicationDate,
-              biometricsDate: extraction.biometricsDate,
-              decisionDate: extraction.decisionDate,
-              waitingDays: extraction.waitingDays,
-              serviceCenter: extraction.serviceCenter,
-              applicantLocation: extraction.applicantLocation,
-              outcome: extraction.outcome,
-              confidence: extraction.confidence,
-              extractionNotes: extraction.extractionNotes,
-              extractorVersion: EXTRACTOR_VERSION,
-            });
-          }
-        }
+          if (extraction.confidence < MIN_CONFIDENCE) continue;
 
-        if (casesToCreate.length > 0) {
-          await tx.extractedCase.createMany({
-            data: casesToCreate,
-            skipDuplicates: true,
+          const created = await tx.extractedCase.upsert({
+            where: { postId: dbPost.id },
+            create: { postId: dbPost.id, ...caseDataFromExtraction(extraction) },
+            update: { ...caseDataFromExtraction(extraction), extractedAt: new Date() },
+            select: { id: true },
           });
-          casesExtracted += casesToCreate.length;
+
+          await syncCaseEvents(tx, created.id, extraction);
+          casesExtracted++;
         }
       }),
       {
@@ -489,40 +529,14 @@ async function processPostsInBatches(
         });
 
         const extraction = extractCaseData(post.content, post.authorNationality);
-        if (extraction.confidence > 0.3) {
-          await tx.extractedCase.upsert({
+        if (extraction.confidence >= MIN_CONFIDENCE) {
+          const upserted = await tx.extractedCase.upsert({
             where: { postId: existing.id },
-            create: {
-              postId: existing.id,
-              applicationType: extraction.applicationType,
-              applicationRoute: extraction.applicationRoute,
-              applicationDate: extraction.applicationDate,
-              biometricsDate: extraction.biometricsDate,
-              decisionDate: extraction.decisionDate,
-              waitingDays: extraction.waitingDays,
-              serviceCenter: extraction.serviceCenter,
-              applicantLocation: extraction.applicantLocation,
-              outcome: extraction.outcome,
-              confidence: extraction.confidence,
-              extractionNotes: extraction.extractionNotes,
-              extractorVersion: EXTRACTOR_VERSION,
-            },
-            update: {
-              applicationType: extraction.applicationType,
-              applicationRoute: extraction.applicationRoute,
-              applicationDate: extraction.applicationDate,
-              biometricsDate: extraction.biometricsDate,
-              decisionDate: extraction.decisionDate,
-              waitingDays: extraction.waitingDays,
-              serviceCenter: extraction.serviceCenter,
-              applicantLocation: extraction.applicantLocation,
-              outcome: extraction.outcome,
-              confidence: extraction.confidence,
-              extractionNotes: extraction.extractionNotes,
-              extractorVersion: EXTRACTOR_VERSION,
-              extractedAt: new Date(),
-            },
+            create: { postId: existing.id, ...caseDataFromExtraction(extraction) },
+            update: { ...caseDataFromExtraction(extraction), extractedAt: new Date() },
+            select: { id: true },
           });
+          await syncCaseEvents(tx, upserted.id, extraction);
           casesExtracted++;
         }
       }),

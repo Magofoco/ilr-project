@@ -4,7 +4,6 @@ import { casesQuerySchema, type CaseWithSource, type PaginatedResponse } from '@
 
 export async function casesRoutes(fastify: FastifyInstance) {
   // Auth is handled by the authenticated scope in index.ts.
-  // All routes here automatically require a valid JWT.
 
   // List cases with filters
   fastify.get('/', async (request): Promise<PaginatedResponse<CaseWithSource>> => {
@@ -12,22 +11,14 @@ export async function casesRoutes(fastify: FastifyInstance) {
 
     const where: Prisma.ExtractedCaseWhereInput = {};
 
-    // Apply filters
-    if (query.applicationRoute) {
-      where.applicationRoute = query.applicationRoute;
-    }
-    if (query.applicationType) {
-      where.applicationType = query.applicationType;
-    }
-    if (query.serviceCenter) {
-      where.serviceCenter = query.serviceCenter;
-    }
-    if (query.outcome) {
-      where.outcome = query.outcome;
-    }
-    if (query.sourceId) {
-      where.post = { thread: { sourceId: query.sourceId } };
-    }
+    if (query.applicationRoute) where.applicationRoute = query.applicationRoute;
+    if (query.applicationType) where.applicationType = query.applicationType;
+    if (query.serviceTier) where.serviceTier = query.serviceTier;
+    if (query.biometricsLocation) where.biometricsLocation = query.biometricsLocation;
+    if (query.applicantNationalityCode) where.applicantNationalityCode = query.applicantNationalityCode;
+    if (query.outcome) where.outcome = query.outcome;
+    if (query.sourceId) where.post = { thread: { sourceId: query.sourceId } };
+
     if (query.fromDate || query.toDate) {
       where.applicationDate = {};
       if (query.fromDate) where.applicationDate.gte = query.fromDate;
@@ -37,10 +28,8 @@ export async function casesRoutes(fastify: FastifyInstance) {
       where.confidence = { gte: query.minConfidence };
     }
 
-    // Count total
     const total = await prisma.extractedCase.count({ where });
 
-    // Fetch paginated results
     const cases = await prisma.extractedCase.findMany({
       where,
       include: {
@@ -55,13 +44,7 @@ export async function casesRoutes(fastify: FastifyInstance) {
                 id: true,
                 title: true,
                 url: true,
-                source: {
-                  select: {
-                    id: true,
-                    name: true,
-                    displayName: true,
-                  },
-                },
+                source: { select: { id: true, name: true, displayName: true } },
               },
             },
           },
@@ -73,13 +56,69 @@ export async function casesRoutes(fastify: FastifyInstance) {
     });
 
     return {
-      data: cases as CaseWithSource[],
+      data: cases as unknown as CaseWithSource[],
       pagination: {
         page: query.page,
         limit: query.limit,
         total,
         totalPages: Math.ceil(total / query.limit),
       },
+    };
+  });
+
+  // Get available filter options for the UI dropdowns.
+  fastify.get('/filters', async () => {
+    const [routes, types, locations, tiers, nationalities, sources] = await Promise.all([
+      prisma.extractedCase.findMany({
+        where: { applicationRoute: { not: null } },
+        select: { applicationRoute: true },
+        distinct: ['applicationRoute'],
+      }),
+      prisma.extractedCase.findMany({
+        where: { applicationType: { not: null } },
+        select: { applicationType: true },
+        distinct: ['applicationType'],
+      }),
+      prisma.extractedCase.findMany({
+        where: { biometricsLocation: { not: null } },
+        select: { biometricsLocation: true },
+        distinct: ['biometricsLocation'],
+      }),
+      prisma.extractedCase.findMany({
+        where: { serviceTier: { not: null } },
+        select: { serviceTier: true },
+        distinct: ['serviceTier'],
+      }),
+      prisma.extractedCase.findMany({
+        where: { applicantNationalityCode: { not: null } },
+        select: { applicantNationalityCode: true },
+        distinct: ['applicantNationalityCode'],
+      }),
+      prisma.sourceForum.findMany({
+        where: { isActive: true },
+        select: { id: true, name: true, displayName: true },
+      }),
+    ]);
+
+    return {
+      applicationRoutes: routes
+        .map((r: { applicationRoute: string | null }) => r.applicationRoute)
+        .filter((v): v is string => Boolean(v)),
+      applicationTypes: types
+        .map((t: { applicationType: string | null }) => t.applicationType)
+        .filter((v): v is string => Boolean(v)),
+      biometricsLocations: locations
+        .map((l: { biometricsLocation: string | null }) => l.biometricsLocation)
+        .filter((v): v is string => Boolean(v))
+        .sort((a, b) => a.localeCompare(b)),
+      serviceTiers: tiers
+        .map((t: { serviceTier: string | null }) => t.serviceTier)
+        .filter((v): v is string => Boolean(v)),
+      nationalityCodes: nationalities
+        .map((n: { applicantNationalityCode: string | null }) => n.applicantNationalityCode)
+        .filter((v): v is string => Boolean(v))
+        .sort(),
+      sources,
     };
   });
 
@@ -101,16 +140,13 @@ export async function casesRoutes(fastify: FastifyInstance) {
                 id: true,
                 title: true,
                 url: true,
-                source: {
-                  select: {
-                    id: true,
-                    name: true,
-                    displayName: true,
-                  },
-                },
+                source: { select: { id: true, name: true, displayName: true } },
               },
             },
           },
+        },
+        events: {
+          orderBy: { eventDate: 'asc' },
         },
       },
     });
@@ -124,37 +160,5 @@ export async function casesRoutes(fastify: FastifyInstance) {
     }
 
     return caseData;
-  });
-
-  // Get available filter options
-  fastify.get('/filters', async () => {
-    const [routes, types, centers, sources] = await Promise.all([
-      prisma.extractedCase.findMany({
-        where: { applicationRoute: { not: null } },
-        select: { applicationRoute: true },
-        distinct: ['applicationRoute'],
-      }),
-      prisma.extractedCase.findMany({
-        where: { applicationType: { not: null } },
-        select: { applicationType: true },
-        distinct: ['applicationType'],
-      }),
-      prisma.extractedCase.findMany({
-        where: { serviceCenter: { not: null } },
-        select: { serviceCenter: true },
-        distinct: ['serviceCenter'],
-      }),
-      prisma.sourceForum.findMany({
-        where: { isActive: true },
-        select: { id: true, name: true, displayName: true },
-      }),
-    ]);
-
-    return {
-      applicationRoutes: routes.map((r: { applicationRoute: string | null }) => r.applicationRoute).filter(Boolean),
-      applicationTypes: types.map((t: { applicationType: string | null }) => t.applicationType).filter(Boolean),
-      serviceCenters: centers.map((c: { serviceCenter: string | null }) => c.serviceCenter).filter(Boolean),
-      sources,
-    };
   });
 }

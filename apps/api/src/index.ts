@@ -7,6 +7,7 @@ import { authPlugin } from './plugins/auth.js';
 import { healthRoutes } from './routes/health.js';
 import { statsRoutes } from './routes/stats.js';
 import { casesRoutes } from './routes/cases.js';
+import { estimateRoutes } from './routes/estimate.js';
 import { adminRoutes } from './routes/admin.js';
 
 // ============================================
@@ -79,6 +80,7 @@ async function main() {
 
     await app.register(statsRoutes, { prefix: '/stats' });
     await app.register(casesRoutes, { prefix: '/cases' });
+    await app.register(estimateRoutes, { prefix: '/estimate' });
 
     // ------------------------------------------
     // ADMIN ROUTES (JWT + admin role)
