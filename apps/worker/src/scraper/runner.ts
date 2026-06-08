@@ -63,6 +63,8 @@ interface RunScraperOptions {
   adapter: SourceAdapter;
   since?: Date;
   maxThreads?: number;
+  /** Cap pages per thread (useful for smoke testing the scraper). */
+  maxPages?: number;
   dryRun: boolean;
   resume?: boolean;
 }
@@ -146,7 +148,7 @@ function shouldStop(): boolean {
 }
 
 export async function runScraper(options: RunScraperOptions): Promise<void> {
-  const { source, adapter, since, maxThreads, dryRun, resume = true } = options;
+  const { source, adapter, since, maxThreads, maxPages, dryRun, resume = true } = options;
   const runStartTime = Date.now();
 
   // Debug: verify DB connection goes where we expect
@@ -255,6 +257,7 @@ export async function runScraper(options: RunScraperOptions): Promise<void> {
 
         const { totalPosts, progress } = await adapter.getPosts(thread, {
           startFromPage,
+          maxPages,
 
           // Called for each page's posts — persist to DB immediately
           onPageData: async (pagePosts, pageNum) => {

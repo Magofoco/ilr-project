@@ -9,6 +9,9 @@
     "build": "tsc",
     "type-check": "tsc --noEmit",
     "seed": "tsx src/seed.ts",
+    "scrape": "tsx src/index.ts run",
+    "reextract": "tsx src/index.ts reextract",
+    "list-sources": "tsx src/index.ts list-sources",
     "test:extract": "tsx src/test-extraction.ts",
     "test:km": "tsx src/test-kaplan-meier.ts",
     "test": "tsx src/test-extraction.ts && tsx src/test-kaplan-meier.ts"

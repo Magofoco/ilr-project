@@ -150,6 +150,10 @@ export interface GetPostsOptions {
   /** Page to start scraping from (1-indexed). Used for resume. */
   startFromPage?: number;
 
+  /** Maximum number of pages to scrape in this run (counted from `startFromPage`).
+   *  Useful for smoke tests. When unset, scrape all pages. */
+  maxPages?: number;
+
   /** Called after each page is scraped with that page's posts.
    *  The runner should persist these immediately — the adapter does NOT accumulate them. */
   onPageData?: (posts: ScrapedPost[], pageNum: number) => Promise<void>;

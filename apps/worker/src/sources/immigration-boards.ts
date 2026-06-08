@@ -549,6 +549,7 @@ export function createImmigrationBoardsAdapter(source: SourceForum): SourceAdapt
     async getPosts(thread, options = {}): Promise<GetPostsResult> {
       const config = getConfig();
       const startFromPage = options.startFromPage || 1;
+      const maxPages = options.maxPages;
       let totalPostsScraped = 0;
       
       // Reset popup state for new scrape session
@@ -587,11 +588,17 @@ export function createImmigrationBoardsAdapter(source: SourceForum): SourceAdapt
         await page.waitForSelector('.post, div[id^="p"]', { timeout: 15_000 });
         
         totalPages = await getTotalPages(page);
-        const totalPagesToScrape = totalPages - startFromPage + 1;
-        console.log(`  Thread has ${totalPages} pages total, scraping ${totalPagesToScrape} pages (${startFromPage} to ${totalPages})`);
-        
+        // Cap how far we scrape if maxPages is set (useful for smoke tests).
+        const lastPageToScrape = maxPages
+          ? Math.min(totalPages, startFromPage + maxPages - 1)
+          : totalPages;
+        const totalPagesToScrape = lastPageToScrape - startFromPage + 1;
+        console.log(
+          `  Thread has ${totalPages} pages total, scraping ${totalPagesToScrape} pages (${startFromPage} to ${lastPageToScrape}${maxPages ? `, capped by --max-pages ${maxPages}` : ''})`
+        );
+
         // Scrape pages — stream each page's posts to the caller immediately
-        for (currentPage = startFromPage; currentPage <= totalPages; currentPage++) {
+        for (currentPage = startFromPage; currentPage <= lastPageToScrape; currentPage++) {
           const isFirstPage = currentPage === startFromPage;
 
           try {
@@ -612,11 +619,11 @@ export function createImmigrationBoardsAdapter(source: SourceForum): SourceAdapt
               // Progress logging with ETA
               const elapsed = (Date.now() - startTime) / 1000;
               const avgPerPage = elapsed / pagesCompleted;
-              const remaining = (totalPages - currentPage) * avgPerPage;
-              
-              if (currentPage === startFromPage || currentPage % 10 === 0 || currentPage === totalPages) {
+              const remaining = (lastPageToScrape - currentPage) * avgPerPage;
+
+              if (currentPage === startFromPage || currentPage % 10 === 0 || currentPage === lastPageToScrape) {
                 console.log(
-                  `    Page ${currentPage}/${totalPages}: ${pagePosts.length} posts` +
+                  `    Page ${currentPage}/${lastPageToScrape}: ${pagePosts.length} posts` +
                   ` | ${pagesCompleted}/${totalPagesToScrape} done` +
                   ` | ETA: ${formatDuration(remaining)}` +
                   ` | Total posts: ${totalPostsScraped}`
@@ -671,7 +678,7 @@ export function createImmigrationBoardsAdapter(source: SourceForum): SourceAdapt
           }
           
           // Rate limiting between pages
-          if (currentPage < totalPages) {
+          if (currentPage < lastPageToScrape) {
             const waitTime = getJitter();
             await delay(waitTime);
           }
