@@ -210,7 +210,7 @@ export async function runScraper(options: RunScraperOptions): Promise<void> {
 
             if (dryRun) {
               for (const post of pagePosts) {
-                const extraction = extractCaseData(post.content);
+                const extraction = extractCaseData(post.content, post.authorNationality);
                 if (extraction.confidence > 0.3) {
                   console.log(`    [DRY RUN] Would extract: ${extraction.applicationRoute || 'unknown route'} (${(extraction.confidence * 100).toFixed(0)}%)`);
                   stats.casesExtracted++;
@@ -404,6 +404,7 @@ async function processPostsInBatches(
             threadId,
             externalId: post.externalId,
             authorName: post.authorName,
+            authorNationality: post.authorNationality,
             content: post.content,
             contentHash: post.contentHash,
             postedAt: post.postedAt,
@@ -422,10 +423,13 @@ async function processPostsInBatches(
         });
 
         // Extract cases and prepare for batch insert
+        // Build nationality lookup from the original scraped batch
+        const nationalityMap = new Map(batch.map((p) => [p.externalId, p.authorNationality]));
         const casesToCreate: Prisma.ExtractedCaseCreateManyInput[] = [];
         
         for (const dbPost of createdPosts) {
-          const extraction = extractCaseData(dbPost.content);
+          const nationality = nationalityMap.get(dbPost.externalId);
+          const extraction = extractCaseData(dbPost.content, nationality);
           if (extraction.confidence > 0.3) {
             casesToCreate.push({
               postId: dbPost.id,
@@ -478,12 +482,13 @@ async function processPostsInBatches(
           data: {
             content: post.content,
             contentHash: post.contentHash,
+            authorNationality: post.authorNationality,
             scrapedAt: new Date(),
             pageNumber: post.pageNumber,
           },
         });
 
-        const extraction = extractCaseData(post.content);
+        const extraction = extractCaseData(post.content, post.authorNationality);
         if (extraction.confidence > 0.3) {
           await tx.extractedCase.upsert({
             where: { postId: existing.id },

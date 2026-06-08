@@ -5,7 +5,7 @@ import type { ExtractionResult } from '@ilr/shared';
  * Stored alongside each extracted case so you can re-extract old posts
  * when the extractor improves.
  */
-export const EXTRACTOR_VERSION = '1.1';
+export const EXTRACTOR_VERSION = '1.2';
 
 /**
  * Extract ILR case data from immigrationboards.com post content
@@ -21,7 +21,7 @@ export const EXTRACTOR_VERSION = '1.1';
  * 
  * But formats vary between users. This extractor handles variations.
  */
-export function extractCaseData(content: string): ExtractionResult {
+export function extractCaseData(content: string, authorNationality?: string): ExtractionResult {
   const result: ExtractionResult = {
     confidence: 0,
   };
@@ -214,6 +214,16 @@ export function extractCaseData(content: string): ExtractionResult {
       confidenceScore += 0.5;
       break;
     }
+  }
+
+  // ============================================
+  // APPLICANT NATIONALITY / LOCATION
+  // ============================================
+  
+  // Use the forum profile flag (most reliable source)
+  if (authorNationality) {
+    result.applicantLocation = authorNationality;
+    confidenceScore += 0.5;
   }
 
   // ============================================

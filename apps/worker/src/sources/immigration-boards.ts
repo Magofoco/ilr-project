@@ -400,6 +400,7 @@ export function createImmigrationBoardsAdapter(source: SourceForum): SourceAdapt
         externalId: string;
         contentHtml: string;
         authorName: string | null;
+        authorNationality: string | null;
         dateIso: string | null;
         dateText: string | null;
       }> = [];
@@ -438,12 +439,17 @@ export function createImmigrationBoardsAdapter(source: SourceForum): SourceAdapt
         const authorEl = postEl.querySelector('.postprofile .username, .author .username, .postauthor');
         const authorName = authorEl ? authorEl.textContent?.trim() || null : null;
 
-        // 4. Get date
+        // 4. Get author nationality from flag image
+        // The forum shows a flag icon in the post profile: <img class="flag_image" alt="India" ...>
+        const flagEl = postEl.querySelector('.postprofile img.flag_image, .author img.flag_image');
+        const authorNationality = flagEl ? flagEl.getAttribute('alt')?.trim() || null : null;
+
+        // 5. Get date
         const dateEl = postEl.querySelector('.postprofile time, .author time, time');
         const dateIso = dateEl ? dateEl.getAttribute('datetime') : null;
         const dateText = (!dateIso && dateEl) ? dateEl.textContent?.trim() || null : null;
 
-        results.push({ externalId, contentHtml, authorName, dateIso, dateText });
+        results.push({ externalId, contentHtml, authorName, authorNationality, dateIso, dateText });
       });
 
       return results;
@@ -473,6 +479,7 @@ export function createImmigrationBoardsAdapter(source: SourceForum): SourceAdapt
           externalId: raw.externalId,
           content,
           authorName: raw.authorName || undefined,
+          authorNationality: raw.authorNationality || undefined,
           postedAt,
           pageNumber: pageNum,
         });

@@ -87,6 +87,7 @@ export interface ScrapedThread {
 export interface ScrapedPost {
   externalId: string;
   authorName?: string;
+  authorNationality?: string; // From forum profile flag (e.g., "India", "Nigeria")
   content: string;
   postedAt?: Date;
   pageNumber?: number; // Which page of the thread this post was on

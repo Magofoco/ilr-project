@@ -62,9 +62,10 @@ model Thread {
 model Post {
   id           String   @id @default(cuid())
   threadId     String   @map("thread_id")
-  externalId   String   @map("external_id") // Forum's own post ID (e.g., "p12345")
-  authorName   String?  @map("author_name")
-  content      String   // Raw content (we store relevant text, not entire HTML)
+  externalId        String   @map("external_id") // Forum's own post ID (e.g., "p12345")
+  authorName        String?  @map("author_name")
+  authorNationality String?  @map("author_nationality") // From forum profile flag image
+  content           String   // Raw content (we store relevant text, not entire HTML)
   contentHash  String   @map("content_hash") // For dedup/change detection
   postedAt     DateTime? @map("posted_at")
   scrapedAt    DateTime @default(now()) @map("scraped_at")
