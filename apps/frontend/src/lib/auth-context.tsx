@@ -7,10 +7,19 @@ interface AuthContextType {
   user: User | null;
   session: Session | null;
   loading: boolean;
+  /** Resolved role from the API (`/auth/me`). `null` until the first call returns. */
+  role: 'user' | 'admin' | null;
+  /** Convenience flag derived from `role`. */
   isAdmin: boolean;
   signIn: (email: string, password: string) => Promise<{ error: Error | null }>;
   signUp: (email: string, password: string) => Promise<{ error: Error | null }>;
   signOut: () => Promise<void>;
+}
+
+interface AuthMeResponse {
+  id: string;
+  email: string;
+  role: 'user' | 'admin';
 }
 
 const AuthContext = createContext<AuthContextType | null>(null);
@@ -19,42 +28,53 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   const [user, setUser] = useState<User | null>(null);
   const [session, setSession] = useState<Session | null>(null);
   const [loading, setLoading] = useState(true);
-  const [isAdmin, setIsAdmin] = useState(false);
+  const [role, setRole] = useState<'user' | 'admin' | null>(null);
 
   useEffect(() => {
-    // Get initial session
+    let cancelled = false;
+
     supabase.auth.getSession().then(({ data: { session } }) => {
+      if (cancelled) return;
       setSession(session);
       setUser(session?.user ?? null);
       if (session?.user) {
-        checkAdminStatus(session);
+        void resolveRole();
       }
       setLoading(false);
     });
 
-    // Listen for auth changes
-    const { data: { subscription } } = supabase.auth.onAuthStateChange((_event, session) => {
+    const {
+      data: { subscription },
+    } = supabase.auth.onAuthStateChange((_event, session) => {
+      if (cancelled) return;
       setSession(session);
       setUser(session?.user ?? null);
       if (session?.user) {
-        checkAdminStatus(session);
+        void resolveRole();
       } else {
-        setIsAdmin(false);
+        setRole(null);
       }
     });
 
-    return () => subscription.unsubscribe();
+    return () => {
+      cancelled = true;
+      subscription.unsubscribe();
+    };
   }, []);
 
-  async function checkAdminStatus(_session: Session) {
+  /**
+   * Asks the API who we are. Source of truth for the user's role — we never
+   * trust the Supabase JWT alone to decide admin access (the role lives in our
+   * own `user_roles` table, not in the token).
+   */
+  async function resolveRole() {
     try {
-      // Try to access an admin endpoint to verify role.
-      // Token is sent automatically by the api client.
-      // If this succeeds, the user is an admin.
-      await api.get('/admin/sources');
-      setIsAdmin(true);
+      const me = await api.get<AuthMeResponse>('/auth/me');
+      setRole(me.role);
     } catch {
-      setIsAdmin(false);
+      // 401 here is handled by the api client (auto-signout). For other
+      // failures, fall back to non-admin rather than leaking elevated UI.
+      setRole('user');
     }
   }
 
@@ -76,11 +96,22 @@ export function AuthProvider({ children }: { children: ReactNode }) {
 
   async function signOut() {
     await supabase.auth.signOut();
-    setIsAdmin(false);
+    setRole(null);
   }
 
   return (
-    <AuthContext.Provider value={{ user, session, loading, isAdmin, signIn, signUp, signOut }}>
+    <AuthContext.Provider
+      value={{
+        user,
+        session,
+        loading,
+        role,
+        isAdmin: role === 'admin',
+        signIn,
+        signUp,
+        signOut,
+      }}
+    >
       {children}
     </AuthContext.Provider>
   );

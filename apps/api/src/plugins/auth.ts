@@ -17,7 +17,17 @@ if (!SUPABASE_URL) {
   );
 }
 
-const JWKS_URL = new URL(`${SUPABASE_URL}/auth/v1/keys`);
+/**
+ * JWKS URL for verifying Supabase JWTs.
+ *
+ * Default: `${SUPABASE_URL}/auth/v1/keys`. Newer Supabase projects expose the
+ * JWKS at `/auth/v1/.well-known/jwks.json` instead — if JWT verification fails
+ * with "no applicable key found" against an otherwise-valid token, set
+ * `SUPABASE_JWKS_URL` to the `.well-known` path and restart the API.
+ */
+const JWKS_URL = new URL(
+  process.env.SUPABASE_JWKS_URL || `${SUPABASE_URL}/auth/v1/keys`
+);
 const ISSUER = `${SUPABASE_URL}/auth/v1`;
 
 // JWKS client — cached and reused across requests

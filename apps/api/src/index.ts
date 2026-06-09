@@ -9,6 +9,7 @@ import { statsRoutes } from './routes/stats.js';
 import { casesRoutes } from './routes/cases.js';
 import { estimateRoutes } from './routes/estimate.js';
 import { adminRoutes } from './routes/admin.js';
+import { authRoutes } from './routes/auth.js';
 
 // ============================================
 // ENV VALIDATION (fail fast)
@@ -83,6 +84,7 @@ async function main() {
   await fastify.register(async function authenticatedScope(app) {
     app.addHook('preHandler', app.verifyJwt);
 
+    await app.register(authRoutes, { prefix: '/auth' });
     await app.register(casesRoutes, { prefix: '/cases' });
     await app.register(estimateRoutes, { prefix: '/estimate' });
 
