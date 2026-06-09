@@ -18,74 +18,90 @@ export function Layout() {
   const { user, isAdmin, signOut } = useAuth();
 
   return (
-    <div className="min-h-screen bg-background">
+    <div className="min-h-screen bg-background flex flex-col">
       {/* Header */}
-      <header className="sticky top-0 z-50 w-full border-b bg-background/95 backdrop-blur supports-[backdrop-filter]:bg-background/60">
-        <div className="container flex h-14 items-center">
-          <Link to="/" className="mr-6 flex items-center space-x-2">
-            <BarChart3 className="h-6 w-6" />
-            <span className="font-bold">ILR Tracker</span>
+      <header className="sticky top-0 z-50 w-full border-b bg-background/85 backdrop-blur supports-backdrop-filter:bg-background/70">
+        <div className="container mx-auto flex h-14 items-center gap-6 px-4">
+          <Link to="/" className="flex items-center gap-2">
+            <BarChart3 className="h-5 w-5 text-primary" />
+            <span className="font-display text-base font-bold text-foreground">
+              ILR Tracker
+            </span>
           </Link>
 
-          <nav className="flex items-center space-x-6 text-sm font-medium flex-1">
-            {navigation.map((item) => (
-              <Link
-                key={item.href}
-                to={item.href}
-                className={cn(
-                  'transition-colors hover:text-foreground/80',
-                  location.pathname === item.href ? 'text-foreground' : 'text-foreground/60'
-                )}
-              >
-                {item.name}
-              </Link>
-            ))}
-            {isAdmin &&
-              adminNavigation.map((item) => (
+          <nav className="hidden flex-1 items-center gap-6 text-xs font-medium md:flex">
+            {[...navigation, ...(isAdmin ? adminNavigation : [])].map((item) => {
+              const active = location.pathname === item.href;
+              return (
                 <Link
                   key={item.href}
                   to={item.href}
                   className={cn(
-                    'transition-colors hover:text-foreground/80',
-                    location.pathname === item.href ? 'text-foreground' : 'text-foreground/60'
+                    'relative py-1 transition-colors',
+                    active
+                      ? 'text-foreground after:absolute after:-bottom-[15px] after:left-0 after:h-[2px] after:w-full after:bg-primary'
+                      : 'text-muted-foreground hover:text-foreground'
                   )}
                 >
                   {item.name}
                 </Link>
-              ))}
+              );
+            })}
           </nav>
 
-          <div className="flex items-center space-x-2">
+          <div className="ml-auto flex items-center gap-2">
             {user ? (
               <>
-                <span className="text-sm text-muted-foreground">{user.email}</span>
-                <Button variant="ghost" size="sm" onClick={signOut}>
-                  <LogOut className="h-4 w-4 mr-2" />
+                <span className="hidden text-xs text-muted-foreground md:inline">
+                  {user.email}
+                </span>
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  className="h-8 text-xs"
+                  onClick={signOut}
+                >
+                  <LogOut className="mr-1.5 h-3.5 w-3.5" />
                   Sign out
                 </Button>
               </>
             ) : (
-              <Button variant="ghost" size="sm" asChild>
-                <Link to="/login">
-                  <LogIn className="h-4 w-4 mr-2" />
-                  Sign in
-                </Link>
-              </Button>
+              <>
+                <Button asChild variant="ghost" size="sm" className="h-8 text-xs">
+                  <Link to="/login">
+                    <LogIn className="mr-1.5 h-3.5 w-3.5" />
+                    Sign in
+                  </Link>
+                </Button>
+                <Button
+                  asChild
+                  size="sm"
+                  className="h-8 rounded-lg px-4 text-xs font-semibold"
+                >
+                  <Link to="/signup">Sign up</Link>
+                </Button>
+              </>
             )}
           </div>
         </div>
       </header>
 
       {/* Main content */}
-      <main className="container py-6">
+      <main className="container mx-auto flex-1 px-4 py-8 md:py-10">
         <Outlet />
       </main>
 
       {/* Footer */}
-      <footer className="border-t py-6 md:py-0">
-        <div className="container flex flex-col items-center justify-between gap-4 md:h-14 md:flex-row">
-          <p className="text-sm text-muted-foreground">
-            Data sourced from public immigration forums. Not affiliated with UK Home Office.
+      <footer className="border-t bg-muted/30">
+        <div className="container mx-auto flex flex-col items-center justify-between gap-2 px-4 py-6 text-xs text-muted-foreground md:h-14 md:flex-row md:py-0">
+          <p>
+            Built from public UK immigration forum posts. Not affiliated with
+            the Home Office.
+          </p>
+          <p>
+            <strong className="font-medium text-foreground">
+              Statistics, not immigration advice.
+            </strong>
           </p>
         </div>
       </footer>

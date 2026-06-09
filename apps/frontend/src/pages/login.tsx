@@ -6,6 +6,7 @@ import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
 import { useAuth } from '@/lib/auth-context';
 import { BarChart3 } from 'lucide-react';
+import { AuthShell } from './auth-shell';
 
 export function Login() {
   const [email, setEmail] = useState('');
@@ -27,7 +28,7 @@ export function Login() {
       } else {
         navigate('/dashboard');
       }
-    } catch (err) {
+    } catch {
       setError('An unexpected error occurred');
     } finally {
       setLoading(false);
@@ -35,25 +36,33 @@ export function Login() {
   };
 
   return (
-    <div className="min-h-screen flex items-center justify-center bg-background px-4">
-      <Card className="w-full max-w-md">
-        <CardHeader className="text-center">
-          <div className="flex justify-center mb-4">
-            <BarChart3 className="h-10 w-10" />
-          </div>
-          <CardTitle className="text-2xl">Welcome back</CardTitle>
-          <CardDescription>Sign in to your ILR Tracker account</CardDescription>
+    <AuthShell>
+      <Link to="/" className="mb-8 inline-flex items-center gap-2">
+        <BarChart3 className="h-5 w-5 text-primary" />
+        <span className="font-display text-base font-bold text-foreground">
+          ILR Tracker
+        </span>
+      </Link>
+
+      <Card className="w-full shadow-xl shadow-foreground/4">
+        <CardHeader className="space-y-1 pb-4 text-center">
+          <CardTitle className="font-display text-2xl">Welcome back</CardTitle>
+          <CardDescription>
+            Sign in to see your personalised ILR estimate
+          </CardDescription>
         </CardHeader>
         <CardContent>
           <form onSubmit={handleSubmit} className="space-y-4">
             {error && (
-              <div className="p-3 text-sm text-destructive bg-destructive/10 rounded-md">
+              <div className="rounded-md border border-destructive/30 bg-destructive/5 p-3 text-sm text-destructive">
                 {error}
               </div>
             )}
 
-            <div className="space-y-2">
-              <Label htmlFor="email">Email</Label>
+            <div className="space-y-1.5">
+              <Label htmlFor="email" className="text-xs text-muted-foreground">
+                Email
+              </Label>
               <Input
                 id="email"
                 type="email"
@@ -61,39 +70,51 @@ export function Login() {
                 value={email}
                 onChange={(e) => setEmail(e.target.value)}
                 required
+                autoComplete="email"
               />
             </div>
 
-            <div className="space-y-2">
-              <Label htmlFor="password">Password</Label>
+            <div className="space-y-1.5">
+              <Label htmlFor="password" className="text-xs text-muted-foreground">
+                Password
+              </Label>
               <Input
                 id="password"
                 type="password"
                 value={password}
                 onChange={(e) => setPassword(e.target.value)}
                 required
+                autoComplete="current-password"
               />
             </div>
 
-            <Button type="submit" className="w-full" disabled={loading}>
-              {loading ? 'Signing in...' : 'Sign in'}
+            <Button
+              type="submit"
+              className="w-full shadow-md shadow-primary/20"
+              disabled={loading}
+            >
+              {loading ? 'Signing in…' : 'Sign in'}
             </Button>
           </form>
 
           <div className="mt-6 text-center text-sm">
-            <span className="text-muted-foreground">Don't have an account? </span>
-            <Link to="/signup" className="text-primary hover:underline">
+            <span className="text-muted-foreground">Don&rsquo;t have an account? </span>
+            <Link
+              to="/signup"
+              className="font-medium text-primary hover:underline"
+            >
               Sign up
-            </Link>
-          </div>
-
-          <div className="mt-4 text-center">
-            <Link to="/" className="text-sm text-muted-foreground hover:underline">
-              Back to home
             </Link>
           </div>
         </CardContent>
       </Card>
-    </div>
+
+      <Link
+        to="/"
+        className="mt-6 text-xs text-muted-foreground transition-colors hover:text-foreground"
+      >
+        ← Back to home
+      </Link>
+    </AuthShell>
   );
 }

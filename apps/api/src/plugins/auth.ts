@@ -1,4 +1,5 @@
 import type { FastifyInstance, FastifyRequest, FastifyReply } from 'fastify';
+import fp from 'fastify-plugin';
 import { createRemoteJWKSet, jwtVerify } from 'jose';
 import { prisma } from '@ilr/db';
 import type { AuthUser } from '@ilr/shared';
@@ -48,7 +49,7 @@ interface JwtPayload {
 // PLUGIN
 // ============================================
 
-export async function authPlugin(fastify: FastifyInstance) {
+async function authPluginImpl(fastify: FastifyInstance) {
   /**
    * Verifies the Supabase JWT from the Authorization header,
    * then looks up the user's role in our database.
@@ -120,3 +121,10 @@ export async function authPlugin(fastify: FastifyInstance) {
     }
   });
 }
+
+// Wrap with fastify-plugin so the `verifyJwt` and `requireAdmin` decorators
+// are exposed on the parent Fastify instance, not encapsulated inside this plugin's scope.
+export const authPlugin = fp(authPluginImpl, {
+  name: 'authPlugin',
+  fastify: '5.x',
+});

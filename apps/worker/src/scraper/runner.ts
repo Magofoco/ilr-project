@@ -65,6 +65,9 @@ interface RunScraperOptions {
   maxThreads?: number;
   /** Cap pages per thread (useful for smoke testing the scraper). */
   maxPages?: number;
+  /** Explicit starting page (overrides resume). Use to jump into recent pages
+   *  of an old thread instead of re-scraping the start. */
+  fromPage?: number;
   dryRun: boolean;
   resume?: boolean;
 }
@@ -148,7 +151,7 @@ function shouldStop(): boolean {
 }
 
 export async function runScraper(options: RunScraperOptions): Promise<void> {
-  const { source, adapter, since, maxThreads, maxPages, dryRun, resume = true } = options;
+  const { source, adapter, since, maxThreads, maxPages, fromPage, dryRun, resume = true } = options;
   const runStartTime = Date.now();
 
   // Debug: verify DB connection goes where we expect
@@ -244,9 +247,12 @@ export async function runScraper(options: RunScraperOptions): Promise<void> {
               }
             );
 
-        // Determine starting page for resume
+        // Determine starting page. --from-page wins over both resume state and default.
         let startFromPage = 1;
-        if (resume && dbThread?.lastScrapedPage && dbThread.lastScrapedPage > 0) {
+        if (fromPage && fromPage > 0) {
+          startFromPage = fromPage;
+          console.log(`  Starting from page ${startFromPage} (--from-page override)`);
+        } else if (resume && dbThread?.lastScrapedPage && dbThread.lastScrapedPage > 0) {
           startFromPage = dbThread.lastScrapedPage;
           console.log(`  Resuming from page ${startFromPage}`);
         }

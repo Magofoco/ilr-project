@@ -2,7 +2,7 @@ import { Card, CardContent } from "@/components/ui/card";
 
 const testimonials = [
   {
-    quote: "I was refreshing forums obsessively. ILR Timelines showed me my wait was actually normal \u2014 and I got approved 2 weeks later.",
+    quote: "I was refreshing forums obsessively. ILR Tracker showed me my wait was actually normal \u2014 and I got approved 2 weeks later.",
     name: "Priya S.",
     detail: "India \u00B7 138 days",
   },

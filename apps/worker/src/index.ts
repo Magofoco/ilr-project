@@ -69,10 +69,11 @@ program
   .option('--since <date>', 'Only scrape content since this date (ISO format)')
   .option('--max-threads <n>', 'Maximum number of threads to scrape', parseInt)
   .option('--max-pages <n>', 'Maximum pages per thread (useful for smoke tests)', parseInt)
+  .option('--from-page <n>', 'Start scraping from this page (overrides resume)', parseInt)
   .option('--dry-run', 'Run without saving to database')
   .option('--no-resume', 'Start from page 1 instead of resuming from last scraped page')
   .action(async (options) => {
-    const { source: sourceName, since, maxThreads, maxPages, dryRun, resume } = options;
+    const { source: sourceName, since, maxThreads, maxPages, fromPage, dryRun, resume } = options;
 
     console.log(`\n========================================`);
     console.log(`ILR Worker - Scrape Run`);
@@ -81,6 +82,7 @@ program
     console.log(`Since:       ${since || 'all time'}`);
     console.log(`Max threads: ${maxThreads || 'unlimited'}`);
     console.log(`Max pages:   ${maxPages || 'unlimited'}`);
+    console.log(`From page:   ${fromPage || '(resume / page 1)'}`);
     console.log(`Dry run:     ${dryRun || false}`);
     console.log(`Resume:      ${resume}`);
     console.log(`========================================\n`);
@@ -131,6 +133,7 @@ program
         since: since ? new Date(since) : undefined,
         maxThreads,
         maxPages,
+        fromPage,
         dryRun: dryRun || false,
         resume: resume !== false,
       });

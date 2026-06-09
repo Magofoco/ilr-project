@@ -7,7 +7,8 @@ import { buildKmInputs, computeApprovalRate, loadCohort } from '../lib/cohort.js
 const DAY_MS = 1000 * 60 * 60 * 24;
 
 export async function statsRoutes(fastify: FastifyInstance) {
-  // Auth is handled by the authenticated scope in index.ts.
+  // Public route — aggregate, anonymized stats are intentionally accessible
+  // without auth (free-tier funnel). See AGENTS.md "Pricing direction".
 
   fastify.get('/overview', async (): Promise<OverviewStats> => {
     const now = new Date();

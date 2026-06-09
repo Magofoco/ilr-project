@@ -7,20 +7,20 @@ const Navbar = () => {
   const { user, signOut } = useAuth();
 
   return (
-    <header className="sticky top-0 z-50 w-full border-b bg-background/95 backdrop-blur supports-[backdrop-filter]:bg-background/60">
+    <header className="sticky top-0 z-50 w-full border-b bg-background/95 backdrop-blur supports-backdrop-filter:bg-background/60">
       <div className="container mx-auto flex h-14 items-center justify-between px-4">
         {/* Logo */}
         <Link to="/" className="flex items-center gap-2">
           <BarChart3 className="h-5 w-5 text-primary" />
-          <span className="font-display text-base font-bold text-foreground">ILR Timelines</span>
+          <span className="font-display text-base font-bold text-foreground">ILR Tracker</span>
         </Link>
 
         {/* Section links — hidden on mobile */}
         <nav className="hidden items-center gap-6 text-xs font-medium text-muted-foreground md:flex">
           {[
-            { label: "Stats", href: "#stats" },
-            { label: "How It Works", href: "#how-it-works" },
-            { label: "Dashboard", href: "#preview" },
+            { label: "Live data", href: "#stats" },
+            { label: "How it works", href: "#how-it-works" },
+            { label: "Preview", href: "#preview" },
             { label: "FAQ", href: "#faq" },
           ].map((item) => (
             <a

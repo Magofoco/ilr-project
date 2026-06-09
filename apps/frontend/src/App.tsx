@@ -101,11 +101,18 @@ export function App() {
       <Route path="/auth/callback" element={<AuthCallback />} />
 
       {/*
+        Public dashboard — aggregate, anonymized stats are the free-tier
+        funnel (per AGENTS.md "Pricing direction"). No auth required.
+      */}
+      <Route element={<Layout />}>
+        <Route path="/dashboard" element={<Dashboard />} />
+      </Route>
+
+      {/*
         Protected routes — requires valid Supabase session.
-        To add a new page: just add a <Route> here. That's it.
+        Comparable-case lists assume a logged-in user (k-anonymity rule).
       */}
       <Route element={<ProtectedLayout />}>
-        <Route path="/dashboard" element={<Dashboard />} />
         <Route path="/cases" element={<Cases />} />
       </Route>
 

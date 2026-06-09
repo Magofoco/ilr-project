@@ -31,7 +31,7 @@ const DashboardPreview = () => {
                 <div className="h-2.5 w-2.5 rounded-full" style={{ background: "hsl(130 50% 56%)" }} />
               </div>
               <div className="ml-3 flex-1 rounded-md bg-background px-3 py-1 text-[11px] text-muted-foreground">
-                ilr-timelines.co.uk/dashboard
+                ilr-tracker.co.uk/dashboard
               </div>
             </div>
 

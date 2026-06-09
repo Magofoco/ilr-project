@@ -4,6 +4,8 @@ import tailwindcss from '@tailwindcss/vite';
 import path from 'node:path';
 
 export default defineConfig({
+  // Load env from the monorepo root so a single .env feeds all apps.
+  envDir: path.resolve(__dirname, '../../'),
   plugins: [react(), tailwindcss()],
   resolve: {
     alias: {

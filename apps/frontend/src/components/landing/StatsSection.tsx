@@ -30,9 +30,9 @@ const lineConfig = {
 };
 
 const counters = [
-  { icon: Database, label: "Data points", value: "12,847", sub: "from 6 forums" },
-  { icon: Users, label: "Nationalities", value: "54", sub: "tracked globally" },
-  { icon: TrendingUp, label: "Avg. processing", value: "142d", sub: "across all types" },
+  { icon: Database, label: "Real cases", value: "12,847", sub: "from public forum posts" },
+  { icon: Users, label: "Nationalities covered", value: "54", sub: "and growing" },
+  { icon: TrendingUp, label: "Typical wait", value: "142d", sub: "across all routes today" },
 ];
 
 const StatsSection = () => {
@@ -40,12 +40,13 @@ const StatsSection = () => {
     <section id="stats" className="border-y bg-muted/30 py-20 md:py-28">
       <div className="container mx-auto px-4">
         <div className="mx-auto mb-16 max-w-2xl text-center">
-          <p className="mb-3 text-xs font-semibold uppercase tracking-widest text-primary">Live Data</p>
+          <p className="mb-3 text-xs font-semibold uppercase tracking-widest text-primary">Live data</p>
           <h2 className="mb-4 text-3xl font-bold text-foreground md:text-4xl">
-            Processing time insights
+            Real numbers from real applicants
           </h2>
           <p className="text-base text-muted-foreground">
-            Updated daily from real applicant reports across UK immigration forums.
+            Updated daily from thousands of public posts. Hover any chart to see
+            the figures behind it.
           </p>
         </div>
 
@@ -71,7 +72,7 @@ const StatsSection = () => {
           <Card className="border bg-card shadow-none">
             <CardHeader className="pb-2">
               <CardTitle className="text-sm font-semibold uppercase tracking-wider text-muted-foreground">
-                By Nationality
+                Typical wait by nationality
               </CardTitle>
             </CardHeader>
             <CardContent>
@@ -89,7 +90,7 @@ const StatsSection = () => {
           <Card className="border bg-card shadow-none">
             <CardHeader className="pb-2">
               <CardTitle className="text-sm font-semibold uppercase tracking-wider text-muted-foreground">
-                6-Month Trend
+                Last 6 months
               </CardTitle>
             </CardHeader>
             <CardContent>

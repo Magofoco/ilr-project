@@ -63,9 +63,14 @@ async function main() {
 
   // ============================================
   // PUBLIC ROUTES (no auth)
+  //
+  // Aggregate, anonymized stats are intentionally
+  // public — they are the free-tier funnel into the
+  // paid personalized estimator.
   // ============================================
 
   await fastify.register(healthRoutes, { prefix: '/health' });
+  await fastify.register(statsRoutes, { prefix: '/stats' });
 
   // ============================================
   // AUTHENTICATED ROUTES (JWT required)
@@ -78,7 +83,6 @@ async function main() {
   await fastify.register(async function authenticatedScope(app) {
     app.addHook('preHandler', app.verifyJwt);
 
-    await app.register(statsRoutes, { prefix: '/stats' });
     await app.register(casesRoutes, { prefix: '/cases' });
     await app.register(estimateRoutes, { prefix: '/estimate' });
 

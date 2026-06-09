@@ -16,6 +16,7 @@
     "@ilr/db": "workspace:*",
     "@ilr/shared": "workspace:*",
     "fastify": "^5.2.1",
+    "fastify-plugin": "^5.1.0",
     "jose": "^6.0.10",
     "zod": "^3.24.1"
   },
