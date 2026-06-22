@@ -7,6 +7,7 @@ import { Label } from '@/components/ui/label';
 import { useAuth } from '@/lib/auth-context';
 import { BarChart3 } from 'lucide-react';
 import { AuthShell } from './auth-shell';
+import { GoogleSignInButton } from '@/components/google-sign-in-button';
 
 export function Login() {
   const [email, setEmail] = useState('');
@@ -52,6 +53,16 @@ export function Login() {
           </CardDescription>
         </CardHeader>
         <CardContent>
+          <GoogleSignInButton onError={setError} />
+
+          <div className="my-4 flex items-center gap-3">
+            <div className="h-px flex-1 bg-border" />
+            <span className="text-[11px] uppercase tracking-wider text-muted-foreground">
+              or
+            </span>
+            <div className="h-px flex-1 bg-border" />
+          </div>
+
           <form onSubmit={handleSubmit} className="space-y-4">
             {error && (
               <div className="rounded-md border border-destructive/30 bg-destructive/5 p-3 text-sm text-destructive">
