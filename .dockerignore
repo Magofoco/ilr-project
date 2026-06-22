@@ -32,8 +32,8 @@ coverage
 
 # Environment (secrets - don't include in image)
 .env
-.env.local
-.env.*.local
+.env.*
+!.env.example
 
 # Turborepo
 .turbo

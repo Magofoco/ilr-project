@@ -15,7 +15,9 @@ import { authRoutes } from './routes/auth.js';
 // ENV VALIDATION (fail fast)
 // ============================================
 
-const PORT = parseInt(process.env.API_PORT || '3001', 10);
+// PORT (set by Railway / most PaaS) takes precedence over API_PORT;
+// API_PORT keeps local-dev parity with the rest of the env-var naming.
+const PORT = parseInt(process.env.PORT || process.env.API_PORT || '3001', 10);
 const HOST = process.env.API_HOST || '0.0.0.0';
 
 const requiredEnvVars = ['SUPABASE_URL', 'DATABASE_URL'] as const;
