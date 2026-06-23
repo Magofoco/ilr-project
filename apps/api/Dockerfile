@@ -47,7 +47,11 @@ RUN pnpm --filter @ilr/db run db:generate \
 # ---- 3. Runtime ------------------------------------------------------------
 ENV NODE_ENV=production
 ENV API_HOST=0.0.0.0
-# Railway injects PORT; this is just a documented default for local docker runs.
+# Railway (and most PaaS) inject their own PORT env var at runtime — Railway
+# currently uses 8080. The values below are only the defaults for a bare
+# `docker run` locally, and EXPOSE is informational metadata, not enforced.
+# When deploying, make sure the platform's public-domain target port matches
+# whatever PORT it injects (e.g. Railway: 8080), not 3001.
 ENV PORT=3001
 EXPOSE 3001
 
