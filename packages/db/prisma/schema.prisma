@@ -246,8 +246,8 @@ model UserRole {
 // double-grant. Always upsert by stripeEventId in the webhook handler.
 
 enum Product {
-  ilr_tracker // £29 one-off — ILR waiting-time estimator
-  life_in_uk  // Life in the UK test preparation (future)
+  ILR_TRACKER // £29 one-off — ILR waiting-time estimator
+  LIFE_IN_UK  // Life in the UK test preparation (future)
   // Add new products here. Bundles are represented as multiple Entitlements
   // under a single Purchase, NOT as a separate product value.
 }
