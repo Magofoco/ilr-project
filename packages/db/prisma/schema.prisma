@@ -232,3 +232,108 @@ model UserRole {
   @@index([role])
   @@map("user_roles")
 }
+
+// ============================================
+// PRODUCTS / PURCHASES / ENTITLEMENTS
+// ============================================
+// Pattern: one Purchase represents a money flow (Stripe Checkout session).
+// A Purchase grants one or more Entitlements (rows in the entitlements table),
+// each of which represents access to a specific Product. This separates
+// "what was paid" from "what the user can access" — bundles, refunds, and
+// manual/promo grants all model cleanly without special cases.
+//
+// Idempotency: StripeEvent.stripeEventId is unique so webhook retries can't
+// double-grant. Always upsert by stripeEventId in the webhook handler.
+
+enum Product {
+  ilr_tracker // £29 one-off — ILR waiting-time estimator
+  life_in_uk  // Life in the UK test preparation (future)
+  // Add new products here. Bundles are represented as multiple Entitlements
+  // under a single Purchase, NOT as a separate product value.
+}
+
+model Purchase {
+  id                    String   @id @default(cuid())
+  // Supabase Auth user ID (matches UserRole.userId convention; no FK).
+  userId                String   @map("user_id")
+
+  // Stripe linkage
+  stripeCustomerId      String?  @map("stripe_customer_id")
+  stripeCheckoutId      String?  @unique @map("stripe_checkout_id")
+  stripePaymentIntentId String?  @map("stripe_payment_intent_id")
+  stripeSubscriptionId  String?  @map("stripe_subscription_id") // For recurring (e.g. £4.99/mo add-on)
+
+  // Money
+  amountPaidCents       Int      @map("amount_paid_cents") // 2900 = £29.00
+  currency              String   @default("GBP")           // ISO-4217
+
+  // Lifecycle
+  // "paid" | "refunded" | "partially_refunded" | "disputed" | "failed" | "pending"
+  status                String   @default("paid")
+  source                String   @default("stripe") // "stripe" | "promo" | "manual"
+  refundedAt            DateTime? @map("refunded_at")
+
+  createdAt             DateTime @default(now()) @map("created_at")
+  updatedAt             DateTime @updatedAt        @map("updated_at")
+
+  entitlements          Entitlement[]
+
+  @@index([userId])
+  @@index([status])
+  @@index([stripeCustomerId])
+  @@map("purchases")
+}
+
+model Entitlement {
+  id          String   @id @default(cuid())
+  // Supabase Auth user ID. Duplicated from Purchase.userId for fast access
+  // checks without a JOIN (the hot path: "does this user have access to X?").
+  userId      String   @map("user_id")
+  product     Product
+
+  // null = manual grant or promo (no money flow). Otherwise the parent Purchase.
+  purchaseId  String?  @map("purchase_id")
+
+  // Lifecycle
+  // "active" | "expired" | "revoked" | "refunded"
+  status      String   @default("active")
+  startedAt   DateTime @default(now()) @map("started_at")
+  expiresAt   DateTime? @map("expires_at") // null = lifetime (e.g. "until decision" until we mark it)
+  revokedAt   DateTime? @map("revoked_at")
+
+  createdAt   DateTime @default(now()) @map("created_at")
+  updatedAt   DateTime @updatedAt        @map("updated_at")
+
+  purchase    Purchase? @relation(fields: [purchaseId], references: [id], onDelete: SetNull)
+
+  // Hot-path query: WHERE userId = ? AND product = ? AND status = 'active'
+  @@index([userId, product, status])
+  @@index([purchaseId])
+  @@map("entitlements")
+}
+
+// ============================================
+// STRIPE WEBHOOK AUDIT LOG
+// ============================================
+// Persisted log of every Stripe webhook we receive. The unique constraint
+// on stripeEventId enforces idempotency — Stripe retries the same event on
+// network failures, deploys, etc., and we must not double-process.
+//
+// processedAt = null and error = null means "not yet processed".
+// processedAt set and error = null means "processed successfully".
+// error set means we tried and failed; safe to retry from the admin UI later.
+
+model StripeEvent {
+  id            String    @id @default(cuid())
+  stripeEventId String    @unique @map("stripe_event_id")
+  type          String    // e.g. "checkout.session.completed", "charge.refunded"
+  payload       Json
+  processedAt   DateTime? @map("processed_at")
+  error         String?
+
+  createdAt     DateTime  @default(now()) @map("created_at")
+
+  @@index([type])
+  @@index([processedAt])
+  @@map("stripe_events")
+}
