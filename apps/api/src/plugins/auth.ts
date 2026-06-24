@@ -95,7 +95,9 @@ async function authPluginImpl(fastify: FastifyInstance) {
       request.user = {
         id: jwtPayload.sub,
         email: jwtPayload.email || '',
-        role: userRole?.role === 'admin' ? 'admin' : 'user',
+        // DB stores Role enum (USER/ADMIN); API contract is lowercase
+        // ('user' | 'admin') so the frontend doesn't need to change.
+        role: userRole?.role === 'ADMIN' ? 'admin' : 'user',
       };
     } catch (err) {
       fastify.log.warn(err, 'JWT verification failed');

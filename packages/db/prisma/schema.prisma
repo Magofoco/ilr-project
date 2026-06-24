@@ -221,10 +221,15 @@ model ScrapeRun {
 // Note: Supabase Auth handles user authentication.
 // This table maps Supabase user IDs to roles.
 
+enum Role {
+  USER
+  ADMIN
+}
+
 model UserRole {
   id        String   @id @default(cuid())
   userId    String   @unique @map("user_id") // Supabase Auth user ID
-  role      String   @default("user") // "user" | "admin"
+  role      Role     @default(USER)
   createdAt DateTime @default(now()) @map("created_at")
   updatedAt DateTime @updatedAt @map("updated_at")
 

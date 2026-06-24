@@ -89,12 +89,12 @@ async function main() {
 
   const role = await prisma.userRole.upsert({
     where: { userId: user.id },
-    update: { role: 'admin' },
-    create: { userId: user.id, role: 'admin' },
+    update: { role: 'ADMIN' },
+    create: { userId: user.id, role: 'ADMIN' },
   });
 
   console.log(
-    `\n\u2713 ${email} is now '${role.role}' in user_roles ` +
+    `\n\u2713 ${email} is now '${role.role.toLowerCase()}' in user_roles ` +
       `(row id=${role.id}).\nReload the app and the Admin link will appear.`,
   );
 }
