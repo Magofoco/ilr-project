@@ -467,10 +467,36 @@ export function createImmigrationBoardsAdapter(source: SourceForum): SourceAdapt
         const flagEl = postEl.querySelector('.postprofile img.flag_image, .author img.flag_image');
         const authorNationality = flagEl ? flagEl.getAttribute('alt')?.trim() || null : null;
 
-        // 5. Get date
-        const dateEl = postEl.querySelector('.postprofile time, .author time, time');
-        const dateIso = dateEl ? dateEl.getAttribute('datetime') : null;
-        const dateText = (!dateIso && dateEl) ? dateEl.textContent?.trim() || null : null;
+        // 5. Get post date — when this post was made on the forum.
+        //
+        // The phpBB skin on immigrationboards.com renders the post header as:
+        //     <p class="author">Post by <strong>USER</strong> » Fri Mar 27, 2026 9:39 pm</p>
+        // with no <time> element. We previously matched only on <time>, which
+        // returned null for every post.
+        //
+        // We MUST avoid the .postprofile sidebar — it contains the user's
+        // "Joined: <date>" registration date, which is not the post date.
+        let dateIso: string | null = null;
+        let dateText: string | null = null;
+
+        // Try a <time> element scoped to the post body first (some skins do
+        // have it). Deliberately exclude .postprofile.
+        const bodyTimeEl = postEl.querySelector('.postbody time, .author time');
+        if (bodyTimeEl) {
+          dateIso = bodyTimeEl.getAttribute('datetime');
+          if (!dateIso) dateText = bodyTimeEl.textContent?.trim() || null;
+        }
+
+        // Fallback: parse the text after "»" in the post-body author line.
+        // The phpBB markup convention is robust across versions: the body's
+        // author paragraph always starts "Post by USER »" followed by date.
+        if (!dateIso && !dateText) {
+          const authorP = postEl.querySelector('.postbody .author, .postbody p.author');
+          const authorText = authorP?.textContent?.trim() ?? '';
+          // "Post by USER » Fri Mar 27, 2026 9:39 pm"
+          const match = authorText.match(/»\s*(.+?)\s*$/);
+          if (match?.[1]) dateText = match[1];
+        }
 
         results.push({ externalId, contentHtml, authorName, authorNationality, dateIso, dateText });
       });

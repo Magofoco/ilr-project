@@ -1,7 +1,73 @@
 import { prisma } from '@ilr/db';
+import { extractCaseData, EXTRACTOR_VERSION } from './extraction/extractor.js';
 
 async function main() {
-  console.log('=== POST EXTERNAL ID PATTERNS ===');
+  console.log(`=== LIVE EXTRACTOR VERSION: ${EXTRACTOR_VERSION} ===\n`);
+
+  console.log('=== LIVE EXTRACTOR RE-CHECK ON NOISY ROWS ===');
+  const noisyForRecheck = await prisma.extractedCase.findMany({
+    where: {
+      biometricsLocation: {
+        in: ['Idv App', 'Saturday', 'Opted Out Of App, Submitted Biometrics In Croydon'],
+      },
+    },
+    select: { id: true, biometricsLocation: true, post: { select: { content: true, authorNationality: true } } },
+    take: 3,
+  });
+  for (const c of noisyForRecheck) {
+    const live = extractCaseData(c.post.content, c.post.authorNationality ?? undefined);
+    console.log(`  id=${c.id}`);
+    console.log(`    db.biometricsLocation = ${JSON.stringify(c.biometricsLocation)}`);
+    console.log(`    live.biometricsLocation = ${JSON.stringify(live.biometricsLocation)}`);
+    console.log(`    live.confidence = ${live.confidence}`);
+  }
+  console.log();
+
+  console.log('=== EXTRACTOR VERSION DISTRIBUTION ===');
+  const versionStats = await prisma.extractedCase.groupBy({
+    by: ['extractorVersion'],
+    _count: true,
+  });
+  for (const v of versionStats) {
+    console.log(`  ${v.extractorVersion ?? '(null)'}: ${v._count}`);
+  }
+
+  console.log('\n=== SAMPLE NOISY BIOMETRICS LOCATIONS (with raw post excerpt) ===');
+  const noisy = await prisma.extractedCase.findMany({
+    where: {
+      biometricsLocation: {
+        in: [
+          'In-person Biometrics At Ukvcas Service Point',
+          'Idv App',
+          'Opted Out Of App, Submitted Biometrics In Croydon',
+          'Idv',
+          'Saturday',
+          'Tls Leeds',
+          'Via Idv App',
+        ],
+      },
+    },
+    select: {
+      id: true,
+      biometricsLocation: true,
+      extractorVersion: true,
+      extractedAt: true,
+      post: { select: { content: true } },
+    },
+    take: 5,
+  });
+  for (const c of noisy) {
+    console.log(`  id=${c.id}`);
+    console.log(`    biometricsLocation="${c.biometricsLocation}"`);
+    console.log(`    extractorVersion=${c.extractorVersion}`);
+    console.log(`    extractedAt=${c.extractedAt.toISOString()}`);
+    // Find the line in the post content that mentions biometrics
+    const lines = c.post.content.split(/\n+/);
+    const bioLine = lines.find((l) => /biometr/i.test(l));
+    console.log(`    bio line: "${bioLine?.slice(0, 200) ?? '(none found)'}"`);
+  }
+
+  console.log('\n=== POST EXTERNAL ID PATTERNS ===');
   const idSamples = await prisma.post.findMany({
     select: { externalId: true, content: true, pageNumber: true },
     take: 1000,

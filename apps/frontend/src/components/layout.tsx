@@ -1,11 +1,12 @@
 import { Link, Outlet, useLocation } from 'react-router-dom';
-import { BarChart3, Table2, Settings, LogOut, LogIn } from 'lucide-react';
+import { BarChart3, Calculator, Table2, Settings, LogOut, LogIn } from 'lucide-react';
 import { useAuth } from '@/lib/auth-context';
 import { Button } from './ui/button';
 import { cn } from '@/lib/utils';
 
 const navigation = [
   { name: 'Dashboard', href: '/dashboard', icon: BarChart3 },
+  { name: 'Estimator', href: '/estimate', icon: Calculator },
   { name: 'Cases', href: '/cases', icon: Table2 },
 ];
 

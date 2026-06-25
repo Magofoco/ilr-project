@@ -12,7 +12,7 @@ import { normalizeNationality } from '@ilr/shared';
  *       biometrics city in parens; docs_requested / docs_submitted milestones;
  *       UTC date parsing; ISO-3166 nationality codes; emit ExtractedEvent[].
  */
-export const EXTRACTOR_VERSION = '1.3';
+export const EXTRACTOR_VERSION = '1.5';
 
 /**
  * Extract ILR case data from a forum post.
@@ -377,23 +377,47 @@ function extractBiometricsDateAndLocation(content: string): BiometricsResult {
 }
 
 /**
- * The parens after a biometrics line frequently contain city, but sometimes
- * they contain noise like "Anytime walk in appointment - £175 fees paid".
- * We only return a value if the parenthetical looks like a place name —
- * mostly letters, a couple of spaces, optionally hyphens, no digits or £
- * symbols. Otherwise we drop it.
+ * The parens after a biometrics line frequently contain a city name, but
+ * sometimes they contain a whole sentence describing the appointment
+ * ("Anytime walk in - £175 fees paid", "In-person biometrics at UKVCAS
+ * service point", "Opted out of app, submitted biometrics in Croydon").
+ *
+ * We deliberately bias toward false negatives — better to leave the field
+ * null than to pollute the cohort with sentence fragments masquerading as
+ * cities. Returns undefined on anything that doesn't look like a clean
+ * place-name token of 1-3 words.
  */
 function cleanBiometricsLocation(raw: string): string | undefined {
   const trimmed = raw.trim();
 
-  // Reject content that contains digits, currency, or obvious noise tokens.
-  if (/[£$€]|\d/.test(trimmed)) return undefined;
-  if (/\b(walk|free|paid|fee|fees|slot|slots|appointment|booked|cancel|reschedule)\b/i.test(trimmed))
-    return undefined;
+  if (trimmed.length < 2 || trimmed.length > 40) return undefined;
 
-  // Cap length and require at least 2 letters.
-  if (trimmed.length < 2 || trimmed.length > 60) return undefined;
-  if (!/[A-Za-z]{2,}/.test(trimmed)) return undefined;
+  // Reject content that contains digits, currency, slashes, commas — these
+  // never appear in a UK place name and almost always signal a sentence.
+  if (/[£$€\d,/]/.test(trimmed)) return undefined;
+
+  // Reject if more than 3 words: real UK locations are short ("Croydon",
+  // "Mark Lane", "Cardiff City Centre"). Anything longer is a sentence.
+  const wordCount = trimmed.split(/\s+/).length;
+  if (wordCount > 3) return undefined;
+
+  // Reject jargon — biometrics-process tokens, app/IDV tokens, sentence
+  // glue words. If any of these appear, this is a description, not a place.
+  // Kept as one alternation for cheap matching.
+  const NOISE_RE =
+    /\b(walk|free|paid|fee|fees|slot|slots|appointment|booked|cancel|reschedule|biometrics?|service|point|centre|center|ukvcas|ukvi|tls|idv|app|in-person|in|out|submitted|opted|dual|submission|ignored|advised|available|across|near|nearest|same|day|hour|hours|min|minutes|of|at|the|by|from|to|off|with|via|using|free-of-charge)\b/i;
+  if (NOISE_RE.test(trimmed)) return undefined;
+
+  // A weekday or month name on its own is never a place — these come from
+  // dates like "(Saturday)" or "(March)" that leaked through the date parser.
+  const TEMPORAL_RE =
+    /^(monday|tuesday|wednesday|thursday|friday|saturday|sunday|january|february|march|april|may|june|july|august|september|october|november|december)$/i;
+  if (TEMPORAL_RE.test(trimmed)) return undefined;
+
+  // Must be mostly letters (allow internal hyphen / apostrophe for names like
+  // "Stoke-on-Trent" — though it'd be filtered above for stop words, leave
+  // the door open in case someone writes "St Albans" or "King's Cross").
+  if (!/^[A-Za-z][A-Za-z\-' ]+$/.test(trimmed)) return undefined;
 
   // Title-case the first letter of each word.
   return trimmed

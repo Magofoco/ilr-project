@@ -3,6 +3,7 @@ import { Layout } from './components/layout';
 import { Landing } from './pages/landing';
 import { Dashboard } from './pages/dashboard';
 import { Cases } from './pages/cases';
+import { Estimate } from './pages/estimate';
 import { Login } from './pages/login';
 import { Signup } from './pages/signup';
 import { AuthCallback } from './pages/auth-callback';
@@ -113,6 +114,7 @@ export function App() {
         Comparable-case lists assume a logged-in user (k-anonymity rule).
       */}
       <Route element={<ProtectedLayout />}>
+        <Route path="/estimate" element={<Estimate />} />
         <Route path="/cases" element={<Cases />} />
       </Route>
 

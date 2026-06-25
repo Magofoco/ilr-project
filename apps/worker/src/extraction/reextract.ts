@@ -1,48 +1,6 @@
 import { prisma, Prisma } from '@ilr/db';
 import { extractCaseData, EXTRACTOR_VERSION } from './extractor.js';
-import type { ExtractionResult } from '@ilr/shared';
-
-/** Mirror of the helpers in scraper/runner.ts — keep these in sync. */
-function caseDataFromExtraction(extraction: ExtractionResult) {
-  return {
-    applicationType: extraction.applicationType,
-    applicationRoute: extraction.applicationRoute,
-    serviceTier: extraction.serviceTier,
-    applicationDate: extraction.applicationDate,
-    biometricsDate: extraction.biometricsDate,
-    docsRequestedDate: extraction.docsRequestedDate,
-    docsSubmittedDate: extraction.docsSubmittedDate,
-    decisionDate: extraction.decisionDate,
-    waitingDays: extraction.waitingDays,
-    biometricsLocation: extraction.biometricsLocation,
-    decisionCenter: extraction.decisionCenter,
-    applicantNationality: extraction.applicantNationality,
-    applicantNationalityCode: extraction.applicantNationalityCode,
-    outcome: extraction.outcome,
-    isPending: extraction.isPending ?? false,
-    confidence: extraction.confidence,
-    extractionNotes: extraction.extractionNotes,
-    extractorVersion: EXTRACTOR_VERSION,
-  };
-}
-
-async function syncCaseEvents(
-  tx: Prisma.TransactionClient,
-  caseId: string,
-  extraction: ExtractionResult
-): Promise<void> {
-  await tx.caseEvent.deleteMany({ where: { caseId } });
-  if (extraction.events.length === 0) return;
-  await tx.caseEvent.createMany({
-    data: extraction.events.map((e) => ({
-      caseId,
-      type: e.type,
-      eventDate: e.date,
-      confidence: e.confidence,
-    })),
-    skipDuplicates: true,
-  });
-}
+import { caseDataFromExtraction, syncCaseEvents } from './persistence.js';
 
 export interface ReextractOptions {
   /**

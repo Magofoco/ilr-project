@@ -2,7 +2,7 @@
  * Shared utility functions
  */
 
-export { normalizeNationality } from './nationality.js';
+export { normalizeNationality, getCountryName } from './nationality.js';
 export { kaplanMeier, kmPercentile, kmDecidedByDayFraction, kmConditionalMedian } from './kaplan-meier.js';
 export type { KmResult, KmPoint, KmInput } from './kaplan-meier.js';
 

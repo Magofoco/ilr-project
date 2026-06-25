@@ -1,62 +1,12 @@
-import { prisma, Prisma, type SourceForum } from '@ilr/db';
-import type { SourceAdapter, ScrapedPost, ScrapeProgress, ExtractionResult } from '@ilr/shared';
+import { prisma, type SourceForum } from '@ilr/db';
+import type { SourceAdapter, ScrapedPost, ScrapeProgress } from '@ilr/shared';
 import { retryWithBackoff } from '@ilr/shared';
 import { extractCaseData, EXTRACTOR_VERSION } from '../extraction/extractor.js';
+import { caseDataFromExtraction, syncCaseEvents } from '../extraction/persistence.js';
 import { hashContent, delay, getJitter } from '../utils/helpers.js';
 
 /** Minimum confidence for an extracted case to be persisted. */
 const MIN_CONFIDENCE = 0.3;
-
-/**
- * Build the `data` payload for ExtractedCase create/update from an
- * ExtractionResult. Centralized so create + update + re-extraction stay in sync.
- */
-function caseDataFromExtraction(extraction: ExtractionResult) {
-  return {
-    applicationType: extraction.applicationType,
-    applicationRoute: extraction.applicationRoute,
-    serviceTier: extraction.serviceTier,
-    applicationDate: extraction.applicationDate,
-    biometricsDate: extraction.biometricsDate,
-    docsRequestedDate: extraction.docsRequestedDate,
-    docsSubmittedDate: extraction.docsSubmittedDate,
-    decisionDate: extraction.decisionDate,
-    waitingDays: extraction.waitingDays,
-    biometricsLocation: extraction.biometricsLocation,
-    decisionCenter: extraction.decisionCenter,
-    applicantNationality: extraction.applicantNationality,
-    applicantNationalityCode: extraction.applicantNationalityCode,
-    outcome: extraction.outcome,
-    isPending: extraction.isPending ?? false,
-    confidence: extraction.confidence,
-    extractionNotes: extraction.extractionNotes,
-    extractorVersion: EXTRACTOR_VERSION,
-  };
-}
-
-/**
- * Replace the events for a case with a fresh set from the extractor.
- * Idempotent: safe to call on re-extraction.
- */
-async function syncCaseEvents(
-  tx: Prisma.TransactionClient,
-  caseId: string,
-  extraction: ExtractionResult
-): Promise<void> {
-  await tx.caseEvent.deleteMany({ where: { caseId } });
-
-  if (extraction.events.length === 0) return;
-
-  await tx.caseEvent.createMany({
-    data: extraction.events.map((e) => ({
-      caseId,
-      type: e.type,
-      eventDate: e.date,
-      confidence: e.confidence,
-    })),
-    skipDuplicates: true,
-  });
-}
 
 interface RunScraperOptions {
   source: SourceForum;
@@ -455,6 +405,7 @@ async function processPostsInBatches(
         id: true,
         externalId: true,
         contentHash: true,
+        postedAt: true,
       },
     }),
     { maxAttempts: 3 }
@@ -464,9 +415,14 @@ async function processPostsInBatches(
     existingPosts.map((p) => [p.externalId, p])
   );
 
-  // Separate posts into new, changed, and unchanged
+  // Separate posts into new, changed, metadata-only-backfill, and unchanged.
+  // The metadata-only backfill catches posts whose content hash hasn't moved
+  // but whose `postedAt` was previously NULL (e.g. scraped before the adapter
+  // learned how to read the author byline). Without this branch a fresh
+  // re-scrape would leave historical postedAt columns NULL forever.
   const newPosts: PostWithHash[] = [];
   const changedPosts: PostWithHash[] = [];
+  const postedAtBackfill: Array<{ id: string; postedAt: Date }> = [];
 
   for (const post of postsWithHashes) {
     const existing = existingPostMap.get(post.externalId);
@@ -474,11 +430,16 @@ async function processPostsInBatches(
       newPosts.push(post);
     } else if (existing.contentHash !== post.contentHash) {
       changedPosts.push(post);
+    } else if (existing.postedAt == null && post.postedAt != null) {
+      postedAtBackfill.push({ id: existing.id, postedAt: post.postedAt });
     }
   }
 
-  const unchangedCount = posts.length - newPosts.length - changedPosts.length;
-  console.log(`    New: ${newPosts.length}, Changed: ${changedPosts.length}, Unchanged: ${unchangedCount}`);
+  const unchangedCount =
+    posts.length - newPosts.length - changedPosts.length - postedAtBackfill.length;
+  console.log(
+    `    New: ${newPosts.length}, Changed: ${changedPosts.length}, postedAt-backfill: ${postedAtBackfill.length}, Unchanged: ${unchangedCount}`,
+  );
 
   // Process new posts in batches with retry
   for (let i = 0; i < newPosts.length; i += BATCH_SIZE) {
@@ -561,6 +522,10 @@ async function processPostsInBatches(
             authorNationality: post.authorNationality,
             scrapedAt: new Date(),
             pageNumber: post.pageNumber,
+            // Only overwrite postedAt if we have a fresh value — adapters can
+            // legitimately return null (no byline parsed) and we don't want
+            // a regression there to clear a previously-good timestamp.
+            ...(post.postedAt != null ? { postedAt: post.postedAt } : {}),
           },
         });
 
@@ -585,6 +550,33 @@ async function processPostsInBatches(
     );
 
     postsProcessed++;
+  }
+
+  // Bulk-backfill postedAt for posts whose body is unchanged. We do this in
+  // batches of `updateMany`-style individual updates so a single bad row
+  // doesn't take the whole page's worth of writes down.
+  if (postedAtBackfill.length > 0) {
+    const BACKFILL_BATCH = 50;
+    for (let i = 0; i < postedAtBackfill.length; i += BACKFILL_BATCH) {
+      if (shutdownRequested) break;
+      const batch = postedAtBackfill.slice(i, i + BACKFILL_BATCH);
+      await retryWithBackoff(
+        () => prisma.$transaction(
+          batch.map((row) =>
+            prisma.post.update({
+              where: { id: row.id },
+              data: { postedAt: row.postedAt },
+            }),
+          ),
+        ),
+        {
+          maxAttempts: 3,
+          onRetry: (attempt, error) => {
+            console.log(`    postedAt backfill retry ${attempt}/3: ${error.message}`);
+          },
+        },
+      );
+    }
   }
 
   return { postsProcessed, casesExtracted };

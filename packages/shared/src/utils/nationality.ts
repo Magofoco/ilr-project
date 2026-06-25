@@ -194,3 +194,15 @@ export function normalizeNationality(raw: string | null | undefined): { code: st
 function escapeRegex(s: string): string {
   return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
+
+/**
+ * Reverse-lookup: ISO-3166 alpha-2 code → canonical display name.
+ * Returns the input unchanged if the code isn't in our list, so callers
+ * can use it as a safe fallback for arbitrary 2-letter strings.
+ */
+const CODE_TO_NAME = new Map(NATIONALITIES.map((n) => [n.code, n.name]));
+
+export function getCountryName(code: string | null | undefined): string | undefined {
+  if (!code) return undefined;
+  return CODE_TO_NAME.get(code.toUpperCase());
+}

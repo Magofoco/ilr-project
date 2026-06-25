@@ -269,7 +269,7 @@ export const overviewStatsSchema = z.object({
 export const scrapeRunSchema = z.object({
   id: z.string(),
   sourceId: z.string(),
-  status: z.enum(['running', 'completed', 'failed']),
+  status: z.enum(['running', 'completed', 'partial', 'failed']),
   startedAt: z.coerce.date(),
   completedAt: z.coerce.date().nullable(),
   threadsFound: z.number(),
