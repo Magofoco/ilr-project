@@ -189,7 +189,7 @@ model CaseEvent {
 model ScrapeRun {
   id            String   @id @default(cuid())
   sourceId      String   @map("source_id")
-  status        String   // "running", "completed", "failed"
+  status        String   // "running" | "completed" | "partial" | "failed"
   startedAt     DateTime @default(now()) @map("started_at")
   completedAt   DateTime? @map("completed_at")
   

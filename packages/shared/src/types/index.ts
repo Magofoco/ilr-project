@@ -167,6 +167,12 @@ export interface GetPostsResult {
   totalPosts: number;
   /** Final progress state. */
   progress: ScrapeProgress;
+  /**
+   * True when the adapter stopped before reaching the last page it intended
+   * to scrape (e.g. due to consecutive transient failures). The caller should
+   * record the run as partial rather than completed.
+   */
+  aborted?: boolean;
 }
 
 export interface SourceAdapter {

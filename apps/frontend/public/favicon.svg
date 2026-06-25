@@ -1,0 +1,39 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-label="ILR Tracker">
+  <title>ILR Tracker</title>
+
+  <!-- Brand tile -->
+  <rect width="64" height="64" rx="14" fill="hsl(172, 55%, 32%)"/>
+
+  <!--
+    Framed hourglass silhouette.
+    Top and bottom horizontal caps extend the bowtie shape so it reads
+    unambiguously as an hourglass at favicon size.
+  -->
+  <path
+    d="M12,10 H52 V12 L32,32 L52,52 V54 H12 V52 L32,32 L12,12 Z"
+    fill="#ffffff"
+  />
+
+  <!--
+    Top bulb: air above the sand.
+    Sand surface drawn as a descending step curve = Kaplan–Meier S(t),
+    the proportion of cases still waiting on a Home Office decision.
+  -->
+  <path
+    d="M12,12 H52 L38,26 H32 V22 H24 V18 H18 L12,12 Z"
+    fill="hsl(172, 55%, 32%)"
+  />
+
+  <!--
+    Bottom bulb: air above the settled pile.
+    Pile drawn as a stepped accumulation = 1 − S(t),
+    the cases that have received their decision so far.
+  -->
+  <path
+    d="M32,32 L48,48 H36 V44 H28 V48 H16 L32,32 Z"
+    fill="hsl(172, 55%, 32%)"
+  />
+
+  <!-- One grain in flight through the pinch: a decision happening right now. -->
+  <circle cx="32" cy="37" r="2" fill="#ffffff"/>
+</svg>

@@ -191,6 +191,11 @@ export async function runScraper(options: RunScraperOptions): Promise<void> {
     casesExtracted: 0,
   };
 
+  // Set to true if any thread aborts mid-scrape (e.g. consecutive page
+  // failures). Drives the final scrape_run status: 'partial' instead of
+  // 'completed' so we don't silently report success on a half-finished run.
+  let anyAborted = false;
+
   try {
     // Step 1: Get threads to scrape
     console.log('Fetching thread list...');
@@ -261,7 +266,7 @@ export async function runScraper(options: RunScraperOptions): Promise<void> {
         let allPostsProcessed = 0;
         let allCasesExtracted = 0;
 
-        const { totalPosts, progress } = await adapter.getPosts(thread, {
+        const { totalPosts, progress, aborted } = await adapter.getPosts(thread, {
           startFromPage,
           maxPages,
 
@@ -315,8 +320,15 @@ export async function runScraper(options: RunScraperOptions): Promise<void> {
           stats.casesExtracted += allCasesExtracted;
         }
 
+        if (aborted) {
+          anyAborted = true;
+        }
+
         const threadElapsed = (Date.now() - threadStartTime) / 1000;
-        console.log(`  Thread complete: ${totalPosts} posts scraped, ${allPostsProcessed} processed, ${allCasesExtracted} cases in ${formatDuration(threadElapsed)}`);
+        console.log(
+          `  Thread complete: ${totalPosts} posts scraped, ${allPostsProcessed} processed, ${allCasesExtracted} cases in ${formatDuration(threadElapsed)}` +
+          (aborted ? ` (PARTIAL: stopped at page ${progress.lastScrapedPage}/${progress.totalPages})` : '')
+        );
 
         // Update final progress
         if (!dryRun && dbThread && !shouldStop()) {
@@ -339,6 +351,11 @@ export async function runScraper(options: RunScraperOptions): Promise<void> {
           console.log('  Stopped due to shutdown request');
           break;
         }
+        // Treat a thrown thread as a partial run, not a silent success.
+        // The runner used to log the error and continue to mark the overall
+        // run 'completed', which made it impossible to tell from
+        // scrape_runs.status whether the corpus had been refreshed.
+        anyAborted = true;
         console.error(`  Error processing thread ${thread.externalId}:`, error instanceof Error ? error.message : error);
       }
     }
@@ -349,14 +366,24 @@ export async function runScraper(options: RunScraperOptions): Promise<void> {
     }
     currentAdapter = null;
 
-    // Update scrape run with success/partial success
+    // Update scrape run with terminal status.
+    // - 'failed'    : user-requested shutdown (SIGINT/SIGTERM)
+    // - 'partial'   : at least one thread aborted (e.g. consecutive page
+    //                 failures) — data persisted but coverage is incomplete
+    // - 'completed' : all threads finished naturally
+    const finalStatus = shouldStop() ? 'failed' : anyAborted ? 'partial' : 'completed';
+    const finalErrorMessage = shouldStop()
+      ? 'Stopped by user'
+      : anyAborted
+        ? 'Aborted early on one or more threads (see worker logs)'
+        : undefined;
     if (scrapeRun) {
       await prisma.scrapeRun.update({
         where: { id: scrapeRun.id },
         data: {
-          status: shouldStop() ? 'failed' : 'completed',
+          status: finalStatus,
           completedAt: new Date(),
-          errorMessage: shouldStop() ? 'Stopped by user' : undefined,
+          errorMessage: finalErrorMessage,
           ...stats,
         },
       });

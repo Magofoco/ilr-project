@@ -10,11 +10,26 @@ const delay = sharedDelay;
 // Fast timeout for element queries (2 seconds instead of default 30s)
 const FAST_TIMEOUT = 2_000;
 
-// Maximum time to spend on a single page (navigation + extraction)
-const PAGE_TIMEOUT_MS = 45_000; // 45 seconds (extraction is fast via page.evaluate)
+// goto() timeout per attempt. immigrationboards.com is frequently slow
+// (cold cache, heavy ads), so 60s gives the page room to finish loading
+// before retry kicks in.
+const GOTO_TIMEOUT_MS = 60_000;
 
-// Maximum consecutive page failures before aborting the thread
-const MAX_CONSECUTIVE_FAILURES = 5;
+// Maximum time to spend on a single page (navigation + extraction + popups
+// + all internal retries). Must be larger than the sum of inner retries
+// (2 goto attempts of GOTO_TIMEOUT_MS each + backoff) plus extraction +
+// popup-handling, otherwise the outer race kills a still-loading page
+// before the inner retry can even try a second time. 180s gives slack.
+const PAGE_TIMEOUT_MS = 180_000;
+
+// Maximum consecutive page failures before aborting the thread. Set
+// relatively high because forum slowness comes in bursts and pages 3-5
+// later in the run almost always succeed.
+const MAX_CONSECUTIVE_FAILURES = 8;
+
+// After a page times out, sleep this long before the next page's navigation
+// to give the forum a chance to recover (and to avoid hammering it).
+const POST_FAILURE_COOLDOWN_MS = 10_000;
 
 /**
  * Strip session IDs from URLs to avoid stale/expired session parameters.
@@ -319,13 +334,16 @@ export function createImmigrationBoardsAdapter(source: SourceForum): SourceAdapt
     
     await retryWithBackoff(
       async () => {
-        await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 30_000 });
+        await page.goto(url, { waitUntil: 'domcontentloaded', timeout: GOTO_TIMEOUT_MS });
       },
       {
-        maxAttempts: 3,
-        initialDelayMs: 2000,
+        // Two attempts only. Adapter-level consecutive-failure tracking
+        // is the proper place to recover from a slow forum; piling more
+        // retries here just burns the outer PAGE_TIMEOUT_MS budget.
+        maxAttempts: 2,
+        initialDelayMs: 5_000,
         onRetry: (attempt, error, nextDelay) => {
-          console.log(`    Retry ${attempt}/3 for page ${pageNum} after ${Math.round(nextDelay / 1000)}s: ${error.message}`);
+          console.log(`    Retry ${attempt}/2 for page ${pageNum} after ${Math.round(nextDelay / 1000)}s: ${error.message}`);
         },
         isRetryable: (error) => {
           const message = error.message.toLowerCase();
@@ -405,7 +423,12 @@ export function createImmigrationBoardsAdapter(source: SourceForum): SourceAdapt
         dateText: string | null;
       }> = [];
 
-      const postElements = document.querySelectorAll('.post, div[id^="p"]');
+      // Use only the post-container selector. phpBB renders each post as
+      // <div class="post" id="pXXXXX">…</div>, with an inner
+      // <div id="post_content_XXXXX"> body. The old selector
+      // ('.post, div[id^="p"]') matched BOTH containers because
+      // post_content_* also starts with 'p', so every post was double-counted.
+      const postElements = document.querySelectorAll('div.post[id^="p"]');
 
       postElements.forEach((postEl: Element, i: number) => {
         // 1. Get post ID
@@ -506,7 +529,7 @@ export function createImmigrationBoardsAdapter(source: SourceForum): SourceAdapt
       (async () => {
         if (!isFirstPage) {
           await navigateToPage(page, threadUrl, pageNum, postsPerPage);
-          await page.waitForSelector('.post, div[id^="p"]', { timeout: 15_000 });
+          await page.waitForSelector('div.post[id^="p"]', { timeout: 15_000 });
         }
         return extractPostsFromPage(page, pageNum);
       })(),
@@ -585,7 +608,7 @@ export function createImmigrationBoardsAdapter(source: SourceForum): SourceAdapt
         // Navigate to starting page to get total pages
         const cleanThreadUrl = stripSessionId(thread.url);
         await navigateToPage(page, cleanThreadUrl, startFromPage, config.postsPerPage);
-        await page.waitForSelector('.post, div[id^="p"]', { timeout: 15_000 });
+        await page.waitForSelector('div.post[id^="p"]', { timeout: 15_000 });
         
         totalPages = await getTotalPages(page);
         // Cap how far we scrape if maxPages is set (useful for smoke tests).
@@ -677,28 +700,37 @@ export function createImmigrationBoardsAdapter(source: SourceForum): SourceAdapt
             await options.onProgress({ lastScrapedPage: currentPage, totalPages });
           }
           
-          // Rate limiting between pages
           if (currentPage < lastPageToScrape) {
-            const waitTime = getJitter();
+            // If we just failed, back off longer to let the forum recover
+            // before requesting the next page. Otherwise normal jitter.
+            const waitTime = consecutiveFailures > 0
+              ? POST_FAILURE_COOLDOWN_MS + getJitter()
+              : getJitter();
+            if (consecutiveFailures > 0) {
+              console.log(`    Cooling down ${Math.round(waitTime / 1000)}s before next page (${consecutiveFailures} consecutive failures)`);
+            }
             await delay(waitTime);
           }
         }
         
+        const aborted = consecutiveFailures >= MAX_CONSECUTIVE_FAILURES;
+
         // Final summary
         const totalElapsed = (Date.now() - startTime) / 1000;
         console.log(
           `  Scrape complete: ${totalPostsScraped} posts from ${pagesCompleted} pages in ${formatDuration(totalElapsed)}` +
-          (consecutiveFailures >= MAX_CONSECUTIVE_FAILURES ? ' (aborted due to failures)' : '')
+          (aborted ? ' (aborted due to failures)' : '')
         );
         
         return {
           totalPosts: totalPostsScraped,
           progress: {
-            lastScrapedPage: consecutiveFailures >= MAX_CONSECUTIVE_FAILURES
+            lastScrapedPage: aborted
               ? currentPage - consecutiveFailures
               : totalPages,
             totalPages,
           },
+          aborted,
         };
       } catch (error) {
         const totalElapsed = (Date.now() - startTime) / 1000;
@@ -710,6 +742,7 @@ export function createImmigrationBoardsAdapter(source: SourceForum): SourceAdapt
             lastScrapedPage: Math.max(currentPage - 1, startFromPage),
             totalPages,
           },
+          aborted: true,
         };
       } finally {
         try {
