@@ -22,6 +22,24 @@ import { hasIlrTrackerEntitlement } from '../lib/entitlements.js';
 /** Maximum comparable cases visible to free-tier users. */
 const FREE_TIER_COMPARABLES = 5;
 
+/**
+ * k-anonymity floor for the comparable-cases LIST (per AGENTS.md). Below
+ * this size we don't expose individual case rows — even though every row
+ * is anonymized to source URL only, a list this small could in theory help
+ * narrow down which forum poster it came from. The summary statistics
+ * (median, cohort size, etc.) are still shown.
+ */
+const COMPARABLE_CASES_K_ANONYMITY = 5;
+
+/**
+ * Cohort-size threshold below which we show a "small cohort, treat as
+ * directional only" disclaimer. This is purely a UI warning — the estimate
+ * is still computed and shown. Kept independent of `minCohortSize` (which
+ * now defaults to 1, controlling relaxation) so the disclaimer behavior
+ * doesn't drift with a knob the caller can tweak.
+ */
+const SMALL_COHORT_THRESHOLD = 30;
+
 const DAY_MS = 1000 * 60 * 60 * 24;
 
 /**
@@ -163,27 +181,38 @@ export async function estimateRoutes(fastify: FastifyInstance) {
     // Free tier sees the first FREE_TIER_COMPARABLES rows; this is enforced
     // at the API level (not just hidden in the UI) so a determined user
     // hitting the endpoint directly can't bypass the paywall.
+    //
+    // k-anonymity: if the cohort is smaller than COMPARABLE_CASES_K_ANONYMITY,
+    // we suppress the LIST entirely (empty array). The summary statistics
+    // are still safe to return.
     const comparableLimit = tier === 'paid' ? 20 : FREE_TIER_COMPARABLES;
-    const comparableCases = cohort
-      .slice()
-      .sort((a, b) => b.applicationDate.getTime() - a.applicationDate.getTime())
-      .slice(0, comparableLimit)
-      .map((r) => ({
-        id: r.id,
-        applicationRoute: r.applicationRoute,
-        serviceTier: r.serviceTier,
-        biometricsLocation: r.biometricsLocation,
-        applicantNationalityCode: r.applicantNationalityCode,
-        applicationDate: r.applicationDate,
-        decisionDate: r.decisionDate,
-        waitingDays: r.decisionDate
-          ? Math.round((r.decisionDate.getTime() - r.applicationDate.getTime()) / DAY_MS)
-          : null,
-        outcome: (r.outcome as EstimateResponse['comparableCases'][number]['outcome']) ?? null,
-        isPending: r.isPending,
-        sourceUrl: r.postUrl,
-        confidence: r.confidence,
-      }));
+    const comparableCases: EstimateResponse['comparableCases'] =
+      cohort.length < COMPARABLE_CASES_K_ANONYMITY
+        ? []
+        : cohort
+            .slice()
+            .sort((a, b) => b.applicationDate.getTime() - a.applicationDate.getTime())
+            .slice(0, comparableLimit)
+            .map((r) => ({
+              id: r.id,
+              applicationRoute: r.applicationRoute,
+              serviceTier: r.serviceTier,
+              biometricsLocation: r.biometricsLocation,
+              applicantNationalityCode: r.applicantNationalityCode,
+              applicationDate: r.applicationDate,
+              decisionDate: r.decisionDate,
+              waitingDays: r.decisionDate
+                ? Math.round(
+                    (r.decisionDate.getTime() - r.applicationDate.getTime()) / DAY_MS,
+                  )
+                : null,
+              outcome:
+                (r.outcome as EstimateResponse['comparableCases'][number]['outcome']) ??
+                null,
+              isPending: r.isPending,
+              sourceUrl: r.postUrl,
+              confidence: r.confidence,
+            }));
 
     const subsampled = subsampleKm(km);
 
@@ -193,7 +222,8 @@ export async function estimateRoutes(fastify: FastifyInstance) {
       pendingCount: km.censoredCount,
       relaxation,
       hasApprovalRate: approvalFraction !== null,
-      minCohortSize: query.minCohortSize,
+      comparableCasesHidden:
+        cohort.length > 0 && cohort.length < COMPARABLE_CASES_K_ANONYMITY,
     });
 
     // Build the full response, then redact premium fields for free tier.
@@ -256,7 +286,8 @@ interface DisclaimerInputs {
   pendingCount: number;
   relaxation: RelaxationStep[];
   hasApprovalRate: boolean;
-  minCohortSize: number;
+  /** True if we suppressed the comparable-cases list under k-anonymity. */
+  comparableCasesHidden: boolean;
 }
 
 /**
@@ -266,33 +297,40 @@ interface DisclaimerInputs {
 function buildDisclaimers(inputs: DisclaimerInputs): string[] {
   const out: string[] = [];
 
-  if (inputs.cohortSize < inputs.minCohortSize) {
+  if (inputs.cohortSize > 0 && inputs.cohortSize < SMALL_COHORT_THRESHOLD) {
+    const noun = inputs.cohortSize === 1 ? 'case' : 'cases';
     out.push(
-      `Cohort is small (${inputs.cohortSize} cases). Estimate is provisional; expect wide uncertainty.`
+      `Cohort is small (${inputs.cohortSize} ${noun}). Treat as directional only — uncertainty is wide.`,
     );
   }
 
   if (inputs.relaxation.length > 0) {
     const dropped = inputs.relaxation.map((r) => r.droppedFilter).join(', ');
     out.push(
-      `Filters were relaxed to find enough comparable cases (dropped: ${dropped}). The estimate now reflects a wider group than the one you specified.`
+      `No exact matches for your filters, so we relaxed them (dropped: ${dropped}). The estimate reflects a wider group than the one you specified.`,
     );
   }
 
   if (inputs.pendingCount > inputs.decidedCount) {
     out.push(
-      'More than half of comparable cases are still pending. Median wait may shift as those cases resolve.'
+      'More than half of comparable cases are still pending. Median wait may shift as those cases resolve.',
     );
   }
 
   if (!inputs.hasApprovalRate) {
     out.push(
-      'Too few decided cases to report a reliable approval rate; this is omitted rather than guessed.'
+      'Too few decided cases to report a reliable approval rate; this is omitted rather than guessed.',
+    );
+  }
+
+  if (inputs.comparableCasesHidden) {
+    out.push(
+      `Individual comparable cases are hidden when the cohort has fewer than ${COMPARABLE_CASES_K_ANONYMITY} people, to protect forum posters\u2019 anonymity. The summary numbers still reflect your full cohort.`,
     );
   }
 
   out.push(
-    'Source data comes from public forums and is biased: applicants with unusually short or long waits are over-represented. Treat this as a directional signal, not a guarantee.'
+    'Source data comes from public forums and is biased: applicants with unusually short or long waits are over-represented. Treat this as a directional signal, not a guarantee.',
   );
 
   return out;

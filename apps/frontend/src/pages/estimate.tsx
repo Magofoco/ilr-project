@@ -613,14 +613,18 @@ function Results({
       {/* Cohort makeup + relaxation chain — visible to everyone (it's part of the honesty pitch) */}
       <CohortSummary data={data} />
 
-      {/* Comparable cases — table renders whatever the API sent (5 or 20) */}
+      {/* Comparable cases — table renders whatever the API sent (5 or 20).
+          Empty array means the API suppressed it (k-anonymity); the
+          disclaimer block will explain that, so we don't double-message. */}
       <ComparableCasesTable data={data} />
-      {isFree && data.cohortSize > data.comparableCases.length && (
-        <UnlockMoreCasesCard
-          shown={data.comparableCases.length}
-          total={data.cohortSize}
-        />
-      )}
+      {isFree &&
+        data.comparableCases.length > 0 &&
+        data.cohortSize > data.comparableCases.length && (
+          <UnlockMoreCasesCard
+            shown={data.comparableCases.length}
+            total={data.cohortSize}
+          />
+        )}
 
       {/* Honest disclaimers */}
       <Disclaimers items={data.disclaimers} />

@@ -141,9 +141,12 @@ export const estimateQuerySchema = z.object({
   // Defaults to 730 (last 2 years) — Brexit/COVID era cases are too different.
   windowDays: z.coerce.number().int().positive().max(3650).default(730),
 
-  // Minimum cohort size before we start returning estimates. Below this,
-  // we relax filters until we hit it (or run out of relaxations).
-  minCohortSize: z.coerce.number().int().positive().max(500).default(30),
+  // Minimum cohort size before we start relaxing filters. With the default
+  // of 1, we only relax to escape a literal 0-case cohort — the user sees
+  // exactly what their filter combination yields, even if it's a single
+  // applicant. Bump this if you want aggressive relaxation back into the
+  // engine (the original textbook KM threshold was 30).
+  minCohortSize: z.coerce.number().int().positive().max(500).default(1),
 });
 
 export const estimatePercentilesSchema = z.object({
