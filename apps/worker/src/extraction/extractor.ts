@@ -12,7 +12,7 @@ import { normalizeNationality } from '@ilr/shared';
  *       biometrics city in parens; docs_requested / docs_submitted milestones;
  *       UTC date parsing; ISO-3166 nationality codes; emit ExtractedEvent[].
  */
-export const EXTRACTOR_VERSION = '1.5';
+export const EXTRACTOR_VERSION = '1.6';
 
 /**
  * Extract ILR case data from a forum post.
@@ -337,6 +337,11 @@ function extractBiometricsDateAndLocation(content: string): BiometricsResult {
   // The "Confirmation Email" line is acknowledgement, not the appointment, so
   // we deliberately exclude it here — it's caught separately in
   // ACKNOWLEDGEMENT_PATTERNS.
+  //
+  // Note on the trailing "lenient" pattern: it allows up to 60 chars of
+  // arbitrary content between the `biometrics` keyword and the date — needed
+  // for natural-language phrasings like "Biometrics in Croydon on 30/8". The
+  // `[^.\n]` guard prevents it from greedily crossing sentence boundaries.
   const linePatterns = [
     new RegExp(
       String.raw`biometrics?\s+appointment\s*[:\-]?\s*` +
@@ -360,6 +365,14 @@ function extractBiometricsDateAndLocation(content: string): BiometricsResult {
         String.raw`(?:\s*\(([^)]+)\))?`,
       'i'
     ),
+    // Lenient fallback: allow free-text between "biometrics" and the date, but
+    // never across a period or newline. Only used to capture an in-line city
+    // via the whitelist below — `cleanBiometricsLocation` is never called on
+    // match[2] here, so the loose phrasing can't pollute the field.
+    new RegExp(
+      String.raw`biometrics?[^.\n]{0,60}?` + DATE_REGEX_FRAGMENT,
+      'i'
+    ),
   ];
 
   for (const pattern of linePatterns) {
@@ -367,13 +380,102 @@ function extractBiometricsDateAndLocation(content: string): BiometricsResult {
     if (match?.[1]) {
       const parsed = parseFlexibleDate(match[1]);
       if (parsed) {
-        const location = match[2] ? cleanBiometricsLocation(match[2]) : undefined;
+        let location = match[2] ? cleanBiometricsLocation(match[2]) : undefined;
+        // Whitelist fallback: if the parens didn't carry a clean city, scan
+        // the matched substring (NOT the whole post — keeps false positives
+        // bounded) for any known UK biometrics centre city.
+        if (!location) location = findKnownUkBiometricsCity(match[0]);
         return { date: parsed, location };
       }
     }
   }
 
   return {};
+}
+
+/**
+ * Curated whitelist of UK biometrics-centre cities used by Sopra Steria
+ * (UKVCAS) and TLS. Order matters: longer / more specific entries first so
+ * "Newcastle Upon Tyne" wins over "Newcastle", "Mark Lane" beats "Mark", etc.
+ *
+ * Deliberately omitted: ambiguous short tokens that double as common English
+ * words ("Bath", "Stoke" on its own, "Hull" — too risky in a free-text scan).
+ */
+const UK_BIOMETRICS_CITIES: string[] = [
+  // Compound names first
+  'Newcastle Upon Tyne',
+  'Stoke-on-Trent',
+  'Milton Keynes',
+  'London Mark Lane',
+  'London Gee Street',
+  'Mark Lane',
+  'Gee Street',
+  // Core (free) UKVCAS centres
+  'Croydon',
+  'Manchester',
+  'Birmingham',
+  'Cardiff',
+  'Glasgow',
+  'Belfast',
+  // Enhanced / premium centres + commonly-cited cities
+  'Wandsworth',
+  'Stratford',
+  'Wembley',
+  'Hounslow',
+  'Liverpool',
+  'Sheffield',
+  'Leeds',
+  'Nottingham',
+  'Bristol',
+  'Reading',
+  'Cambridge',
+  'Oxford',
+  'Edinburgh',
+  'Aberdeen',
+  'Dundee',
+  'Brighton',
+  'Norwich',
+  'Northampton',
+  'Solihull',
+  'Coventry',
+  'Southampton',
+  'Plymouth',
+  'Exeter',
+  'Peterborough',
+  'Guildford',
+  'Sunderland',
+  'Middlesbrough',
+  'Doncaster',
+  'Bradford',
+  'Bolton',
+  'Preston',
+  'Carlisle',
+  'Chester',
+  'Worcester',
+  'Wolverhampton',
+  'Derby',
+  'Leicester',
+  'Luton',
+  'Slough',
+  'Watford',
+  'Romford',
+  'Enfield',
+  'Swansea',
+  'Newcastle',
+  // Generic "London" last — Mark Lane / Gee Street already took precedence
+  'London',
+];
+
+function escapeRegExp(s: string): string {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+function findKnownUkBiometricsCity(text: string): string | undefined {
+  for (const city of UK_BIOMETRICS_CITIES) {
+    const re = new RegExp(`\\b${escapeRegExp(city)}\\b`, 'i');
+    if (re.test(text)) return city;
+  }
+  return undefined;
 }
 
 /**

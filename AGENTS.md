@@ -41,7 +41,7 @@ packages/
   shared/      Zod schemas, TS types, utils (incl. Kaplan–Meier, nationality normalization)
 ```
 
-Key files: `packages/db/prisma/schema.prisma`, `apps/worker/src/extraction/extractor.ts` (current version `1.5`), `apps/worker/src/extraction/persistence.ts` (shared upsert payload — undefined→null coercion lives here), `apps/worker/src/scraper/runner.ts`, `apps/worker/src/sources/immigration-boards.ts`, `apps/api/src/lib/cohort.ts`, `apps/api/src/routes/estimate.ts`, `packages/shared/src/utils/kaplan-meier.ts`.
+Key files: `packages/db/prisma/schema.prisma`, `apps/worker/src/extraction/extractor.ts` (current version `1.6`), `apps/worker/src/extraction/persistence.ts` (shared upsert payload — undefined→null coercion lives here), `apps/worker/src/scraper/runner.ts`, `apps/worker/src/sources/immigration-boards.ts`, `apps/api/src/lib/cohort.ts`, `apps/api/src/lib/entitlements.ts` (free/paid tier gating), `apps/api/src/routes/estimate.ts`, `packages/shared/src/utils/kaplan-meier.ts`.
 
 ## Data model (current)
 

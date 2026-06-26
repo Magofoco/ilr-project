@@ -6,6 +6,7 @@ import {
   kmDecidedByDayFraction,
   kmConditionalMedian,
   type EstimateResponse,
+  type EstimateTier,
   type ServiceTier,
 } from '@ilr/shared';
 import {
@@ -16,6 +17,10 @@ import {
   type CohortFilters,
   type CohortRecord,
 } from '../lib/cohort.js';
+import { hasIlrTrackerEntitlement } from '../lib/entitlements.js';
+
+/** Maximum comparable cases visible to free-tier users. */
+const FREE_TIER_COMPARABLES = 5;
 
 const DAY_MS = 1000 * 60 * 60 * 24;
 
@@ -102,6 +107,13 @@ export async function estimateRoutes(fastify: FastifyInstance) {
     const query = parsed.data;
     const now = new Date();
 
+    // verifyJwt (registered on this scope in index.ts) has already populated
+    // request.user — if it weren't set, the request would have 401ed before
+    // hitting this handler.
+    const userId = request.user?.id;
+    const tier: EstimateTier =
+      userId && (await hasIlrTrackerEntitlement(userId)) ? 'paid' : 'free';
+
     // Build initial cohort filters from the query.
     const initial: CohortFilters = {
       applicantNationalityCode: query.applicantNationalityCode ?? null,
@@ -147,10 +159,15 @@ export async function estimateRoutes(fastify: FastifyInstance) {
     // Sample up to 20 comparable cases — bias the sample toward the
     // applicant's own circumstances by sorting by recency. Usernames are
     // intentionally NOT included; only the source thread URL.
+    //
+    // Free tier sees the first FREE_TIER_COMPARABLES rows; this is enforced
+    // at the API level (not just hidden in the UI) so a determined user
+    // hitting the endpoint directly can't bypass the paywall.
+    const comparableLimit = tier === 'paid' ? 20 : FREE_TIER_COMPARABLES;
     const comparableCases = cohort
       .slice()
       .sort((a, b) => b.applicationDate.getTime() - a.applicationDate.getTime())
-      .slice(0, 20)
+      .slice(0, comparableLimit)
       .map((r) => ({
         id: r.id,
         applicationRoute: r.applicationRoute,
@@ -179,7 +196,12 @@ export async function estimateRoutes(fastify: FastifyInstance) {
       minCohortSize: query.minCohortSize,
     });
 
-    const response: EstimateResponse = {
+    // Build the full response, then redact premium fields for free tier.
+    // Redaction happens here (not in the helpers above) so that paid users
+    // get the same compute path — keeping their slice-of-life identical to
+    // free helps catch any regressions in the redaction layer.
+    const fullResponse: EstimateResponse = {
+      tier,
       cohortSize: cohort.length,
       filtersApplied: {
         applicantNationalityCode: filtersApplied.applicantNationalityCode ?? null,
@@ -204,7 +226,27 @@ export async function estimateRoutes(fastify: FastifyInstance) {
       disclaimers,
     };
 
-    return response;
+    if (tier === 'paid') return fullResponse;
+
+    // Free-tier redaction: keep the cohort median visible (the lone headline
+    // number we promised in the marketing), strip everything else premium.
+    // We deliberately keep cohortRelaxation + filtersApplied + disclaimers
+    // visible — the product's USP is calibrated honesty, and those are part
+    // of that honesty regardless of who's paying.
+    const freeResponse: EstimateResponse = {
+      ...fullResponse,
+      percentiles: {
+        p10: null,
+        p25: null,
+        median: percentiles.median,
+        p75: null,
+        p90: null,
+      },
+      approvalRate: null,
+      kmCurve: [],
+      conditional: null,
+    };
+    return freeResponse;
   });
 }
 

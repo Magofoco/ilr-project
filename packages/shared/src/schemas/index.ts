@@ -188,7 +188,18 @@ export const comparableCaseSchema = z.object({
   confidence: z.number().min(0).max(1),
 });
 
+// Access tier the user has for this response:
+// - `free`: cohort median + 5 sample cases. Percentiles, approval rate, KM
+//   curve, conditional view, and remaining comparable cases are redacted.
+// - `paid`: full response. Granted by an active ILR_TRACKER Entitlement, by
+//   admin role, or by a manual grant (e.g. promo).
+export const estimateTierSchema = z.enum(['free', 'paid']);
+export type EstimateTier = z.infer<typeof estimateTierSchema>;
+
 export const estimateResponseSchema = z.object({
+  // Which feature tier this response was computed at. Drives what the
+  // frontend shows / blurs / locks behind a paywall.
+  tier: estimateTierSchema,
   // Final cohort size used to compute the estimate.
   cohortSize: z.number().int().nonnegative(),
   // Final filter set after any relaxation.

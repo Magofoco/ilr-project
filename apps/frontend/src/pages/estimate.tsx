@@ -39,6 +39,7 @@ import {
   Calendar,
   ExternalLink,
   Hourglass,
+  Lock,
   SearchX,
   ShieldAlert,
   Sparkles,
@@ -580,31 +581,223 @@ function Results({
   data: EstimateResponse;
   appliedAt: string;
 }) {
+  const isFree = data.tier === 'free';
+
+  // The API already redacts premium fields for free users (percentiles
+  // beyond median, approval rate, kmCurve, conditional, 6th+ comparables).
+  // The frontend just decides what to render in their place: clean
+  // "unlock" cards rather than blurred ghosts.
   return (
     <div className="space-y-6">
-      {/* Top-line numbers */}
-      <HeadlineNumbers data={data} />
+      {isFree && <FreePreviewBanner cohortSize={data.cohortSize} />}
 
-      {/* "Where am I now" panel */}
-      {data.conditional && (
+      {/* Top-line numbers — different shape for free vs paid */}
+      {isFree ? (
+        <FreeHeadline data={data} />
+      ) : (
+        <HeadlineNumbers data={data} />
+      )}
+
+      {/* "Where am I now" panel — paid only */}
+      {!isFree && data.conditional && (
         <ConditionalPanel
           conditional={data.conditional}
           applicationDate={appliedAt}
         />
       )}
+      {isFree && appliedAt && <LockedConditionalCard />}
 
-      {/* Survival curve */}
-      <SurvivalChart data={data} />
+      {/* Survival curve — paid only; free sees a locked card */}
+      {isFree ? <LockedChartCard /> : <SurvivalChart data={data} />}
 
-      {/* Cohort makeup + relaxation chain */}
+      {/* Cohort makeup + relaxation chain — visible to everyone (it's part of the honesty pitch) */}
       <CohortSummary data={data} />
 
-      {/* Comparable cases */}
+      {/* Comparable cases — table renders whatever the API sent (5 or 20) */}
       <ComparableCasesTable data={data} />
+      {isFree && data.cohortSize > data.comparableCases.length && (
+        <UnlockMoreCasesCard
+          shown={data.comparableCases.length}
+          total={data.cohortSize}
+        />
+      )}
 
       {/* Honest disclaimers */}
       <Disclaimers items={data.disclaimers} />
     </div>
+  );
+}
+
+// ============================================
+// FREE-TIER COMPONENTS
+// ============================================
+
+/** Top-of-results banner that explains the free preview and offers upgrade. */
+function FreePreviewBanner({ cohortSize }: { cohortSize: number }) {
+  return (
+    <Card className="border-primary/30 bg-linear-to-br from-primary/5 to-chart-2/5">
+      <CardContent className="flex flex-col items-start justify-between gap-3 p-5 sm:flex-row sm:items-center">
+        <div className="min-w-0">
+          <p className="flex items-center gap-1.5 text-[11px] font-semibold uppercase tracking-widest text-primary">
+            <Sparkles className="h-3.5 w-3.5" />
+            Free preview
+          </p>
+          <p className="mt-1 text-sm leading-snug text-foreground">
+            You&rsquo;re seeing the typical wait and 5 comparable cases from{' '}
+            <strong className="font-semibold">{cohortSize.toLocaleString()}</strong>{' '}
+            applicants like you.
+          </p>
+          <p className="mt-1 text-xs text-muted-foreground">
+            Unlock the fast/slow range, approval rate, full wait-time curve,
+            and 15 more cases for £29 — kept active until your decision.
+          </p>
+        </div>
+        <UpgradeButton size="default" />
+      </CardContent>
+    </Card>
+  );
+}
+
+/**
+ * Single-card median display for free users. Replaces the 3-card grid that
+ * paid users see; visually distinct rather than just half-empty.
+ */
+function FreeHeadline({ data }: { data: EstimateResponse }) {
+  const median = data.percentiles.median;
+  const { cohortSize, decidedCount, pendingCount } = data;
+  const cohortTooSmall = cohortSize < 30;
+
+  return (
+    <Card>
+      <CardContent className="p-6">
+        <div className="flex items-start gap-4">
+          <div className="flex h-12 w-12 shrink-0 items-center justify-center rounded-lg bg-accent text-accent-foreground">
+            <Hourglass className="h-6 w-6" />
+          </div>
+          <div className="min-w-0">
+            <p className="flex items-center gap-1.5 text-[11px] font-medium uppercase tracking-wider text-muted-foreground">
+              Typical wait
+              <InfoTip term="median" />
+            </p>
+            <p className="mt-1 font-display text-4xl font-bold text-foreground">
+              {median !== null ? `${median} days` : '—'}
+            </p>
+            <p className="mt-1 text-xs leading-snug text-muted-foreground">
+              {median !== null
+                ? `\u2248 ${monthsFromDays(median)} months from application — the median across comparable applicants.`
+                : 'Not enough decided cases to estimate.'}
+            </p>
+          </div>
+        </div>
+        <p
+          className={cn(
+            'mt-5 border-t pt-4 text-xs',
+            cohortTooSmall ? 'text-amber-700 dark:text-amber-300' : 'text-muted-foreground',
+          )}
+        >
+          Based on{' '}
+          <strong className="font-semibold text-foreground">
+            {cohortSize.toLocaleString()}
+          </strong>{' '}
+          comparable applicants ({decidedCount.toLocaleString()} decided,{' '}
+          {pendingCount.toLocaleString()} still waiting)
+          {cohortTooSmall && ' — small cohort, treat as directional only.'}
+        </p>
+      </CardContent>
+    </Card>
+  );
+}
+
+function LockedConditionalCard() {
+  return (
+    <LockedFeatureCard
+      icon={Calendar}
+      title="Where you are right now"
+      description="See what % of comparable applicants had decided by your current day, and how much longer you might still wait."
+    />
+  );
+}
+
+function LockedChartCard() {
+  return (
+    <LockedFeatureCard
+      icon={TrendingDown}
+      title="The full wait-time curve"
+      description="Decision-by-day curve across your cohort with median + percentile reference lines. Tells you how the wait actually distributes — not just one number."
+    />
+  );
+}
+
+function UnlockMoreCasesCard({
+  shown,
+  total,
+}: {
+  shown: number;
+  total: number;
+}) {
+  return (
+    <Card className="border-dashed bg-muted/30">
+      <CardContent className="flex flex-col items-start justify-between gap-3 p-5 sm:flex-row sm:items-center">
+        <div className="min-w-0">
+          <p className="text-sm font-medium text-foreground">
+            Showing {shown} of up to {Math.min(total, 20).toLocaleString()} comparable cases
+          </p>
+          <p className="mt-1 text-xs text-muted-foreground">
+            See the full sample — recent applicants with route, tier, wait,
+            and source link for each.
+          </p>
+        </div>
+        <UpgradeButton size="sm" />
+      </CardContent>
+    </Card>
+  );
+}
+
+function LockedFeatureCard({
+  icon: Icon,
+  title,
+  description,
+}: {
+  icon: React.ComponentType<{ className?: string }>;
+  title: string;
+  description: string;
+}) {
+  return (
+    <Card className="border-dashed">
+      <CardContent className="flex flex-col items-start gap-3 p-6 sm:flex-row sm:items-center">
+        <div className="flex h-12 w-12 shrink-0 items-center justify-center rounded-lg bg-muted text-muted-foreground">
+          <Icon className="h-6 w-6" />
+        </div>
+        <div className="min-w-0 flex-1">
+          <p className="flex items-center gap-1.5 font-display text-base font-semibold text-foreground">
+            <Lock className="h-3.5 w-3.5 text-muted-foreground" />
+            {title}
+          </p>
+          <p className="mt-1 text-xs leading-snug text-muted-foreground">
+            {description}
+          </p>
+        </div>
+        <UpgradeButton size="sm" />
+      </CardContent>
+    </Card>
+  );
+}
+
+function UpgradeButton({ size = 'default' }: { size?: 'sm' | 'default' }) {
+  return (
+    <Button
+      type="button"
+      size={size}
+      className="shrink-0"
+      onClick={() => {
+        // TODO: wire to Stripe Checkout once /billing endpoint exists.
+        window.alert(
+          'Checkout is coming very soon. Until then, please contact us if you want early access.',
+        );
+      }}
+    >
+      {'Unlock for \u00A329'}
+    </Button>
   );
 }
 
