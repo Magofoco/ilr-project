@@ -210,7 +210,8 @@ export async function estimateRoutes(fastify: FastifyInstance) {
                 (r.outcome as EstimateResponse['comparableCases'][number]['outcome']) ??
                 null,
               isPending: r.isPending,
-              sourceUrl: r.postUrl,
+              sourceUrls: r.sourceUrls,
+              contributingPostCount: r.contributingPostCount,
               confidence: r.confidence,
             }));
 

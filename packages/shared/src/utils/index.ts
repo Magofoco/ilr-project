@@ -5,6 +5,8 @@
 export { normalizeNationality, getCountryName } from './nationality.js';
 export { kaplanMeier, kmPercentile, kmDecidedByDayFraction, kmConditionalMedian } from './kaplan-meier.js';
 export type { KmResult, KmPoint, KmInput } from './kaplan-meier.js';
+export { caseKey, mergeCases } from './case-merge.js';
+export type { MergeableCase, MergedCase } from './case-merge.js';
 
 export interface RetryOptions {
   /** Maximum number of attempts (default: 3) */

@@ -1266,12 +1266,22 @@ function ComparableCasesTable({ data }: { data: EstimateResponse }) {
                   </td>
                   <td className="px-3 py-3">
                     <a
-                      href={row.sourceUrl}
+                      href={row.sourceUrls[0]}
                       target="_blank"
                       rel="noopener noreferrer"
                       className="inline-flex items-center gap-1 text-primary transition-colors hover:text-primary/80 hover:underline"
+                      title={
+                        row.contributingPostCount > 1
+                          ? `Same applicant updated their timeline across ${row.contributingPostCount} forum posts`
+                          : undefined
+                      }
                     >
                       Forum
+                      {row.contributingPostCount > 1 && (
+                        <span className="ml-1 rounded bg-muted px-1.5 py-0.5 text-[10px] font-medium text-muted-foreground">
+                          {row.contributingPostCount}×
+                        </span>
+                      )}
                       <ExternalLink className="h-3 w-3" />
                     </a>
                   </td>

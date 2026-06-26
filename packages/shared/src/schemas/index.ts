@@ -186,8 +186,16 @@ export const comparableCaseSchema = z.object({
   waitingDays: z.number().int().nullable(),
   outcome: outcomeSchema.nullable(),
   isPending: z.boolean(),
-  // Source URL for transparency. Username is intentionally not included.
-  sourceUrl: z.string().url(),
+  // All source URLs that contributed to this merged case, in chronological
+  // order. Most cases have exactly one entry; multi-entry rows are "the
+  // same forum user updated their timeline across N posts". Usernames are
+  // intentionally NOT included.
+  sourceUrls: z.array(z.string().url()).min(1),
+  /**
+   * How many raw forum posts contributed to this merged case. UI can show
+   * this as a "Updated N times" badge for transparency.
+   */
+  contributingPostCount: z.number().int().positive(),
   confidence: z.number().min(0).max(1),
 });
 

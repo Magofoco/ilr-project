@@ -7,7 +7,14 @@
  */
 
 import { prisma, Prisma } from '@ilr/db';
-import { kaplanMeier, kmDecidedByDayFraction, type KmInput, type KmResult } from '@ilr/shared';
+import {
+  kaplanMeier,
+  kmDecidedByDayFraction,
+  mergeCases,
+  type KmInput,
+  type KmResult,
+  type MergeableCase,
+} from '@ilr/shared';
 import type { ServiceTier } from '@ilr/shared';
 
 const DAY_MS = 1000 * 60 * 60 * 24;
@@ -23,7 +30,13 @@ export interface CohortFilters {
   minConfidence?: number;
 }
 
+/**
+ * A row in the cohort the estimator runs over. Post-merge, this corresponds
+ * to ONE applicant (one merged case), not one raw forum post — see
+ * `docs/case-merge-design.md` and `@ilr/shared`'s `mergeCases`.
+ */
 export interface CohortRecord {
+  /** Stable case key produced by `caseKey()`. Doubles as the comparable-case id. */
   id: string;
   applicationDate: Date;
   decisionDate: Date | null;
@@ -34,7 +47,14 @@ export interface CohortRecord {
   biometricsLocation: string | null;
   applicantNationalityCode: string | null;
   confidence: number;
-  postUrl: string;
+  /**
+   * ALL forum URLs that contributed to this merged case, in chronological
+   * order. Most cases have exactly one entry; the multi-entry case is "the
+   * same user updated their timeline across N replies".
+   */
+  sourceUrls: string[];
+  /** Number of contributing posts. Useful for transparency in the UI. */
+  contributingPostCount: number;
 }
 
 /**
@@ -72,7 +92,19 @@ export function buildCohortWhere(filters: CohortFilters, now: Date): Prisma.Extr
   return where;
 }
 
-/** Load the cohort records as a flat array. */
+/**
+ * Load the cohort, then collapse multi-post-per-applicant rows into one
+ * merged case per applicant (see `docs/case-merge-design.md`).
+ *
+ * The merge happens here, before relaxation and KM, so every downstream
+ * helper (`buildKmInputs`, `computeApprovalRate`, the comparable-cases
+ * endpoint) automatically sees one row = one applicant.
+ *
+ * IMPORTANT: filter relaxation re-calls `loadCohort` with progressively
+ * looser filters. Each call re-merges. That's correct: a user whose
+ * posts all carry the same `biometricsLocation` collapses cleanly whether
+ * we filter on it or not.
+ */
 export async function loadCohort(filters: CohortFilters, now: Date = new Date()): Promise<CohortRecord[]> {
   const where = buildCohortWhere(filters, now);
 
@@ -81,16 +113,25 @@ export async function loadCohort(filters: CohortFilters, now: Date = new Date())
     select: {
       id: true,
       applicationDate: true,
+      biometricsDate: true,
+      docsRequestedDate: true,
+      docsSubmittedDate: true,
       decisionDate: true,
       outcome: true,
       isPending: true,
       applicationRoute: true,
+      applicationType: true,
       serviceTier: true,
       biometricsLocation: true,
+      decisionCenter: true,
+      applicantNationality: true,
       applicantNationalityCode: true,
       confidence: true,
       post: {
         select: {
+          threadId: true,
+          authorName: true,
+          postedAt: true,
           thread: {
             select: { url: true },
           },
@@ -99,21 +140,53 @@ export async function loadCohort(filters: CohortFilters, now: Date = new Date())
     },
   });
 
-  // The shape from Prisma has nested post.thread.url; flatten.
-  return rows
+  // Map to the MergeableCase shape and drop rows that have no
+  // applicationDate (the survival lens requires a wait-start date).
+  const mergeable: MergeableCase[] = rows
     .filter((r): r is typeof r & { applicationDate: Date } => r.applicationDate !== null)
     .map((r) => ({
       id: r.id,
+      threadId: r.post.threadId,
+      authorName: r.post.authorName,
+      postedAt: r.post.postedAt,
+      sourceUrl: r.post.thread.url,
+      applicationRoute: r.applicationRoute,
+      applicationType: r.applicationType,
+      serviceTier: r.serviceTier,
       applicationDate: r.applicationDate,
+      biometricsDate: r.biometricsDate,
+      docsRequestedDate: r.docsRequestedDate,
+      docsSubmittedDate: r.docsSubmittedDate,
       decisionDate: r.decisionDate,
+      biometricsLocation: r.biometricsLocation,
+      decisionCenter: r.decisionCenter,
+      applicantNationality: r.applicantNationality,
+      applicantNationalityCode: r.applicantNationalityCode,
       outcome: r.outcome,
       isPending: r.isPending,
-      applicationRoute: r.applicationRoute,
-      serviceTier: (r.serviceTier as ServiceTier | null) ?? null,
-      biometricsLocation: r.biometricsLocation,
-      applicantNationalityCode: r.applicantNationalityCode,
       confidence: r.confidence,
-      postUrl: r.post.thread.url,
+    }));
+
+  const merged = mergeCases(mergeable);
+
+  // Project the merged cases to CohortRecord shape. We drop cases that lost
+  // their applicationDate during the merge (shouldn't happen since every
+  // input has one, but the type narrowing makes the downstream usage clean).
+  return merged
+    .filter((m): m is typeof m & { applicationDate: Date } => m.applicationDate !== null)
+    .map((m) => ({
+      id: m.id,
+      applicationDate: m.applicationDate,
+      decisionDate: m.decisionDate,
+      outcome: m.outcome,
+      isPending: m.isPending,
+      applicationRoute: m.applicationRoute,
+      serviceTier: (m.serviceTier as ServiceTier | null) ?? null,
+      biometricsLocation: m.biometricsLocation,
+      applicantNationalityCode: m.applicantNationalityCode,
+      confidence: m.confidence,
+      sourceUrls: m.sourceUrls,
+      contributingPostCount: m.contributingPostCount,
     }));
 }
 

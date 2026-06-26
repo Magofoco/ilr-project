@@ -14,7 +14,8 @@
     "list-sources": "tsx src/index.ts list-sources",
     "test:extract": "tsx src/test-extraction.ts",
     "test:km": "tsx src/test-kaplan-meier.ts",
-    "test": "tsx src/test-extraction.ts && tsx src/test-kaplan-meier.ts"
+    "test:merge": "tsx src/test-case-merge.ts",
+    "test": "tsx src/test-extraction.ts && tsx src/test-kaplan-meier.ts && tsx src/test-case-merge.ts"
   },
   "dependencies": {
     "@ilr/db": "workspace:*",
