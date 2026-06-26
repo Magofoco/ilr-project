@@ -223,6 +223,126 @@ I Wish you all the best.`,
       decisionDateIso: '2017-05-23',
       outcome: 'approved',
       isPending: false,
+      // "Document received by HO :20/12/2016" should now be captured as
+      // acknowledgement; existing extractor missed it entirely.
+      eventTypes: ['applied', 'acknowledgement', 'biometrics', 'decision'],
+    },
+  },
+
+  // ----- v1.7: Approval/Refusal Received with phrase prefix -----
+  // Real-world post (user deedee44, immigrationboards p1676081). The decision
+  // line is "Approval/Refusal Received : receive it 31/08/2018 dated 28/08/2018"
+  // — v1.6 returned outcome=unknown and missed the decision date entirely.
+  {
+    name: 'v1.7: Approval/Refusal Received with verbose value',
+    content: `Applied for ILR Route :DLR, set o, main and 2 dependant.. 3+3 years
+Date application sent : mar 13, 2018
+Document received by HO : mar 15,2018
+Ack letter received (if applicable) :26/03/2018, 23/04/2018, 23/05/2018, 25/06/2018, 23/07/2018, 24/08/2018
+Biometric Letter received : 23/03/2018
+Date Biometrics Enrolled :25/03/2018
+Payment Debited : 30/03/2018
+Approval/Refusal Received : receive it 31/08/2018 dated 28/08/2018
+BRP Card Received :receive one brp.. the rest is on its way...`,
+    expect: {
+      applicationRoute: '10-year',
+      // First date the regex sees after the label is "31/08/2018"
+      decisionDateIso: '2018-08-31',
+      applicationDateIso: '2018-03-13',
+      biometricsDateIso: '2018-03-25',
+      outcome: 'approved',
+      isPending: false,
+    },
+  },
+
+  // ----- v1.7: Approval/Refusal Received : waiting → pending -----
+  {
+    name: 'v1.7: Approval/Refusal Received : waiting',
+    content: `Applied for ILR Route : Set (O)
+Date application sent : 22/01/2018
+Date Biometrics Enrolled : 25/01/2018
+Approval/Refusal Received : still waiting`,
+    expect: {
+      applicationRoute: 'SET(O)',
+      applicationDateIso: '2018-01-22',
+      biometricsDateIso: '2018-01-25',
+      outcome: 'pending',
+      isPending: true,
+      // No decision date expected — the value is "still waiting", not a date.
+      decisionDateIso: undefined,
+    },
+  },
+
+  // ----- v1.7: Approval/Refusal Received : Rejected on <date> -----
+  {
+    name: 'v1.7: Approval/Refusal Received : Rejected on date',
+    content: `Applied for ILR Route : Set (O)
+Date application sent : 20/12/2017
+Date Biometrics Enrolled : 25/12/2017
+Approval/Refusal Received : Rejected on 07/02/2018`,
+    expect: {
+      applicationRoute: 'SET(O)',
+      applicationDateIso: '2017-12-20',
+      biometricsDateIso: '2017-12-25',
+      decisionDateIso: '2018-02-07',
+      outcome: 'rejected',
+      isPending: false,
+    },
+  },
+
+  // ----- v1.7: date formats -----
+  {
+    name: 'v1.7: DD-Mon-YYYY hyphenated text date',
+    content: `Applied for ILR postal Route
+Date application sent : 15-Feb-2018
+Date Biometrics Enrolled :16-Mar-2018`,
+    expect: {
+      applicationDateIso: '2018-02-15',
+      biometricsDateIso: '2018-03-16',
+    },
+  },
+
+  {
+    name: 'v1.7: 2-digit year textual date',
+    content: `Applied for ILR Route : ILR (SET O) Tier 1 G
+Date application sent : 08 Feb 17
+Date Biometrics Enrolled : 20 Feb 17`,
+    expect: {
+      applicationRoute: 'SET(O)',
+      applicationDateIso: '2017-02-08',
+      biometricsDateIso: '2017-02-20',
+    },
+  },
+
+  {
+    name: 'v1.7: ordinal suffix and no-space month-year',
+    content: `Finally received an approval for my ILR application.
+ILR SET(O) application
+application sent: 19th oct 2016
+biometrics done: 10th nov16
+Approval received: 5 Dec 2016`,
+    expect: {
+      applicationRoute: 'SET(O)',
+      applicationDateIso: '2016-10-19',
+      biometricsDateIso: '2016-11-10',
+      decisionDateIso: '2016-12-05',
+      outcome: 'approved',
+    },
+  },
+
+  // ----- v1.7: "On-Line application submitted" prefix -----
+  {
+    name: 'v1.7: On-Line application submitted prefix',
+    content: `Applying from : Florida, USA
+Type of visa applied for : Settlement—Wife
+Priority / Non-Priority : non priority
+Date On-Line application submitted : 15 March 2018
+Date biometrics enrolled : 20 March 2018`,
+    expect: {
+      applicationRoute: 'SET(M)',
+      serviceTier: 'standard',
+      applicationDateIso: '2018-03-15',
+      biometricsDateIso: '2018-03-20',
     },
   },
 ];

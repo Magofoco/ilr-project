@@ -388,8 +388,19 @@ async function processPostsInBatches(
   let postsProcessed = 0;
   let casesExtracted = 0;
 
+  // Defence-in-depth: refuse any post whose external_id starts with
+  // 'post_content'. This was the inner-container id from a long-fixed
+  // selector bug that double-counted every post. We deleted 286 such
+  // rows from the DB in 2026; keep them out for good.
+  const cleanPosts = posts.filter((p) => !p.externalId.startsWith('post_content'));
+  if (cleanPosts.length !== posts.length) {
+    console.warn(
+      `    Dropped ${posts.length - cleanPosts.length} post_content_* duplicate(s) from this page`,
+    );
+  }
+
   // Add content hashes to posts
-  const postsWithHashes: PostWithHash[] = posts.map((post) => ({
+  const postsWithHashes: PostWithHash[] = cleanPosts.map((post) => ({
     ...post,
     contentHash: hashContent(post.content),
   }));
@@ -399,7 +410,7 @@ async function processPostsInBatches(
     () => prisma.post.findMany({
       where: {
         threadId,
-        externalId: { in: posts.map((p) => p.externalId) },
+        externalId: { in: cleanPosts.map((p) => p.externalId) },
       },
       select: {
         id: true,
@@ -436,7 +447,7 @@ async function processPostsInBatches(
   }
 
   const unchangedCount =
-    posts.length - newPosts.length - changedPosts.length - postedAtBackfill.length;
+    cleanPosts.length - newPosts.length - changedPosts.length - postedAtBackfill.length;
   console.log(
     `    New: ${newPosts.length}, Changed: ${changedPosts.length}, postedAt-backfill: ${postedAtBackfill.length}, Unchanged: ${unchangedCount}`,
   );

@@ -435,7 +435,11 @@ export function createImmigrationBoardsAdapter(source: SourceForum): SourceAdapt
         let externalId: string | null = null;
 
         const elId = postEl.getAttribute('id');
-        if (elId?.startsWith('p')) {
+        // Defence-in-depth: even though the selector above shouldn't return
+        // post_content_* elements, refuse them explicitly. We had to delete
+        // 286 such duplicate posts from the DB in 2026 after the old selector
+        // double-matched them; the guard keeps us from regressing.
+        if (elId?.startsWith('p') && !elId.startsWith('post_content')) {
           externalId = elId;
         }
 

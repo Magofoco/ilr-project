@@ -11,8 +11,18 @@ import { normalizeNationality } from '@ilr/shared';
  * 1.3 — first-class serviceTier; BN(O)/Skilled Worker/GTV/Tier 1;
  *       biometrics city in parens; docs_requested / docs_submitted milestones;
  *       UTC date parsing; ISO-3166 nationality codes; emit ExtractedEvent[].
+ * 1.7 — recognise the immigrationboards "Approval/Refusal Received : <date>"
+ *       template (most common decision phrasing on that forum);
+ *       map "Approval/Refusal Received : waiting / still waiting" to pending;
+ *       map "Approval/Refusal Received : Rejected on <date>" to refusal;
+ *       accept date formats DD-Mon-YYYY ("15-Feb-2018"),
+ *       D Mon YY ("08 Feb 17"), and ordinal-suffix days ("19th oct16");
+ *       add "On-Line application submitted" application-date prefix;
+ *       add "Document received by HO" as acknowledgement;
+ *       widen biometrics-location whitelist scan to the whole post when a
+ *       biometrics date was found.
  */
-export const EXTRACTOR_VERSION = '1.6';
+export const EXTRACTOR_VERSION = '1.7';
 
 /**
  * Extract ILR case data from a forum post.
@@ -130,6 +140,19 @@ export function extractCaseData(content: string, authorNationality?: string): Ex
 
   // ============ OUTCOME ============
   result.outcome = inferOutcome(content, !!result.decisionDate);
+
+  // If the post is actually pending but the decision-line regex happened
+  // to capture a date from the value (e.g. "Approval/Refusal Received :
+  // waiting for reply till 25/06/2018"), drop the captured decision date
+  // and the corresponding event. A censored case must not carry a decision
+  // date — the KM estimator keys on isPending/decisionDate consistency.
+  if (result.outcome === 'pending' && result.decisionDate) {
+    result.decisionDate = undefined;
+    result.waitingDays = undefined;
+    const idx = events.findIndex((e) => e.type === 'decision');
+    if (idx >= 0) events.splice(idx, 1);
+  }
+
   if (result.outcome === 'approved' || result.outcome === 'rejected') score += 1;
   else if (result.outcome === 'pending') score += 0.25;
 
@@ -201,7 +224,13 @@ function extractRoute(content: string): RouteMatch | undefined {
   if (/\btier\s*2\b/i.test(haystack)) {
     return { route: 'Tier 2', type: 'ILR' };
   }
-  if (/\bset\s*\(?\s*m\s*\)?|british\s+spouse|spouse\s+of\s+a?\s*british/i.test(haystack)) {
+  if (
+    /\bset\s*\(?\s*m\s*\)?|british\s+spouse|spouse\s+of\s+a?\s*british/i.test(haystack) ||
+    // "Type of visa applied for : Settlement—Wife" (or Husband/Spouse/Partner).
+    // The hyphen variants in the character class handle em-dash, en-dash and
+    // plain hyphen as the separator the forum templates use.
+    /\bsettlement[\s\u2014\u2013\-]+(?:wife|husband|spouse|partner)\b/i.test(haystack)
+  ) {
     return { route: 'SET(M)', type: 'ILR' };
   }
   if (/\bset\s*\(?\s*f\s*\)?/i.test(haystack)) {
@@ -229,14 +258,25 @@ function extractRoute(content: string): RouteMatch | undefined {
 // ============================================================================
 
 function extractServiceTier(content: string): ServiceTier | undefined {
-  // Try the explicit field first — most reliable.
-  const field = content.match(/application\s+type\s*[:\-]?\s*([^\n\r]+)/i)?.[1];
-  if (field) {
+  // Try explicit field labels first — most reliable. We try several
+  // immigrationboards.com variants and stop on the first one that
+  // returns a clean tier from its VALUE (the text after the colon),
+  // rather than scanning the whole post and risking the field LABEL
+  // itself leaking into the match (e.g. "Priority / Non-Priority :
+  // non priority" used to be classified 'priority').
+  const fields: Array<string | undefined> = [
+    content.match(/application\s+type\s*[:\-]?\s*([^\n\r]+)/i)?.[1],
+    content.match(/priority\s*\/\s*non[\s\-]?priority\s*[:\-]?\s*([^\n\r]+)/i)?.[1],
+    content.match(/service\s+tier\s*[:\-]?\s*([^\n\r]+)/i)?.[1],
+  ];
+  for (const field of fields) {
+    if (!field) continue;
     const tier = matchServiceTierString(field);
     if (tier) return tier;
   }
 
-  // Fallback: search whole content.
+  // Fallback: search whole content. Keeps coverage on free-text posts
+  // that say e.g. "I went super priority" without using the template.
   return matchServiceTierString(content);
 }
 
@@ -245,6 +285,14 @@ function matchServiceTierString(s: string): ServiceTier | undefined {
 
   // Order matters: super-priority must come before priority.
   if (/\bsuper[\s\-]*priority\b/.test(lower)) return 'super_priority';
+
+  // "non priority" / "non-priority" / "not priority" is the explicit
+  // free-of-charge UKVI tier — must be checked BEFORE the bare
+  // "priority" alternative below, which would otherwise pick the
+  // wrong word from "non priority".
+  if (/\bnon[\s\-]?priority\b/.test(lower)) return 'standard';
+  if (/\bnot\s+priority\b/.test(lower)) return 'standard';
+
   if (/\b(priority|5[\s\-]?day)\b/.test(lower)) return 'priority';
   if (/\bstandard\b/.test(lower)) return 'standard';
 
@@ -256,9 +304,15 @@ function matchServiceTierString(s: string): ServiceTier | undefined {
 // ============================================================================
 
 // Matches numeric (DD/MM/YYYY etc.) and textual ("3 March 2026", "March 3, 2026") dates.
-// Captured group is the whole date substring.
+// Captured group is the whole date substring. Alternatives in priority order:
+//   - "DD-Mon-YYYY" / "DD/Mon/YYYY" with month as letters (e.g. "15-Feb-2018")
+//   - "D[th] Month YY[YY]" — optional ordinal suffix and 2- or 4-digit year
+//     (e.g. "19th oct16", "08 Feb 17", "3 March 2026"). Also tolerates no
+//     space between month and year, since some forum users type "oct16".
+//   - "Month D, YYYY"     (US textual, "March 3, 2026")
+//   - "DD/MM/YYYY" / "DD-MM-YYYY" / "DD.MM.YYYY" (UK numeric)
 const DATE_REGEX_FRAGMENT =
-  String.raw`(\d{1,2}\s+\w+\s+\d{2,4}|\w+\s+\d{1,2},?\s+\d{4}|\d{1,2}[\s\/\-\.]+\d{1,2}[\s\/\-\.]+\d{2,4})`;
+  String.raw`(\d{1,2}[\-\/][A-Za-z]{3,9}[\-\/]\d{2,4}|\d{1,2}(?:st|nd|rd|th)?\s+[A-Za-z]{3,9}\.?\s*,?\s*\d{2,4}|[A-Za-z]+\s+\d{1,2},?\s+\d{4}|\d{1,2}[\s\/\-\.]+\d{1,2}[\s\/\-\.]+\d{2,4})`;
 
 function buildPatterns(prefixes: string[]): RegExp[] {
   return prefixes.map(
@@ -269,6 +323,10 @@ function buildPatterns(prefixes: string[]): RegExp[] {
 const APPLICATION_PATTERNS = buildPatterns([
   String.raw`(?:date\s+)?application\s+sent`,
   String.raw`application\s+submitted\s+online`,
+  // immigrationboards.com legacy template: "Date On-Line application submitted :"
+  // Earlier versions of this list assumed the keyword "online" came AFTER
+  // "submitted"; this variant has it before, hyphenated.
+  String.raw`(?:date\s+)?on[\-\s]?line\s+application\s+submitted`,
   String.raw`application\s+date`,
   String.raw`(?:date\s+)?applied`,
   String.raw`submitted(?:\s+on)?`,
@@ -278,6 +336,11 @@ const ACKNOWLEDGEMENT_PATTERNS = buildPatterns([
   String.raw`acknowledgement\s+email(?:\s+from\s+ukvi)?`,
   String.raw`(?:application\s+)?receipt\s+confirmation\s+email`,
   String.raw`biometrics?\s+confirmation\s+email`,
+  // immigrationboards postal-route template: "Document received by HO :<date>".
+  // This is the HO acknowledging receipt of the application, not the applicant
+  // sending docs — so it maps to "acknowledgement", not "docs_submitted".
+  String.raw`document\s+received\s+by\s+ho`,
+  String.raw`ack(?:nowledgement)?\s+(?:letter|email)\s+received(?:\s+\(if\s+applicable\))?`,
 ]);
 
 const DOCS_REQUESTED_PATTERNS = buildPatterns([
@@ -295,11 +358,31 @@ const DOCS_SUBMITTED_PATTERNS = buildPatterns([
   String.raw`response\s+sent(?:\s+on)?`,
 ]);
 
-// Decision is the trickiest because the forum has many phrasings.
+  // Decision is the trickiest because the forum has many phrasings.
 // Strict order: a single "approved" / "BRP received" line is enough.
+//
+// NOTE on "Approval/Refusal Received": this is the canonical decision line
+// on immigrationboards.com — every classic timeline post has it. Earlier
+// versions of the extractor deliberately AVOIDED matching the label (to
+// dodge the ambiguity of "approval vs refusal"), which meant the most
+// common decision phrasing on the corpus was silently ignored. We now
+// match it greedily here; the outcome inference logic uses the value
+// (e.g. "Rejected on …") to decide approved vs rejected, and clears the
+// decision date if the value is actually "waiting".
 const DECISION_PATTERNS = buildPatterns([
   String.raw`approval\s+(?:email|received|date)`,
-  String.raw`approval[\/\s]+refusal\s+received`,
+  // The "Approval/Refusal Received : <date>" template, with optional
+  // free-text filler between the colon and the date so phrasings like
+  // "Approval/Refusal Received : Rejected on 07/02/2018" or
+  // "Approval/Refusal Received : receive it 31/08/2018 dated 28/08/2018"
+  // still capture the date. Filler is bounded to a single line so we
+  // can't accidentally cross unrelated milestones. inferOutcome reads the
+  // VALUE to decide approved/rejected/pending; if it returns "pending",
+  // the main extraction flow drops the captured date below (we don't
+  // want a "decided" date on a censored case).
+  String.raw`approval[\/\s]+refusal\s+received[^\n\r]{0,80}?`,
+  // Bare "refusal received <date>" / "rejected <date>" etc. Kept distinct
+  // from the label above so a value-only refusal line still matches.
   String.raw`(?:refusal|refused|rejected|denied)\s+(?:email|received|date|on)?`,
   String.raw`decision\s+(?:received|date|email|made|on)`,
   String.raw`brp\s+(?:card\s+)?received`,
@@ -382,9 +465,15 @@ function extractBiometricsDateAndLocation(content: string): BiometricsResult {
       if (parsed) {
         let location = match[2] ? cleanBiometricsLocation(match[2]) : undefined;
         // Whitelist fallback: if the parens didn't carry a clean city, scan
-        // the matched substring (NOT the whole post — keeps false positives
-        // bounded) for any known UK biometrics centre city.
+        // first the immediate match substring (cheap, high signal), then —
+        // only if still empty — the whole post. We expanded the scan from
+        // match-only to whole-post in v1.7 after auditing the corpus and
+        // finding most users mention the centre city in free text further
+        // down the post (e.g. "had biometrics done at Wandsworth"), not on
+        // the biometrics line itself. The UK_BIOMETRICS_CITIES whitelist
+        // already filters out ambiguous tokens, so post-wide scan is safe.
         if (!location) location = findKnownUkBiometricsCity(match[0]);
+        if (!location) location = findKnownUkBiometricsCity(content);
         return { date: parsed, location };
       }
     }
@@ -535,25 +624,50 @@ function cleanBiometricsLocation(raw: string): string | undefined {
 function inferOutcome(content: string, hasDecisionDate: boolean): 'approved' | 'rejected' | 'pending' | 'unknown' {
   const text = content;
 
+  // The immigrationboards.com timeline template has a single canonical line
+  // for the decision: "Approval/Refusal Received : <value>". We inspect the
+  // value to classify the post. Cheap, deterministic, beats the generic
+  // signal scan below for the bulk of the corpus.
+  const tpl = text.match(/approval\s*\/\s*refusal\s+received\s*[:\-]?\s*([^\n\r]*)/i);
+  if (tpl?.[1]) {
+    const value = tpl[1].trim();
+    if (value.length > 0) {
+      if (/^(?:still\s+)?waiting|^awaiting|^no\s+update|^in\s+progress|^pending/i.test(value)) {
+        return 'pending';
+      }
+      if (/\b(rejected|refused|denied|unsuccessful|refusal)\b/i.test(value)) {
+        return 'rejected';
+      }
+      // A bare date (or a date + "approval/granted" phrasing) here means the
+      // decision came back — and we know in this template that an explicit
+      // refusal would have been written instead. Default to approved.
+      if (/\d/.test(value)) return 'approved';
+    }
+  }
+
   // Strong approval signals — these specifically indicate a decided positive case.
   const strongApproval =
     /\bilr\s+granted\b/i.test(text) ||
     /\bgranted\s+ilr\b/i.test(text) ||
     /\bgot\s+my\s+ilr\b/i.test(text) ||
+    // "received my ILR" / "received our ILR" — specific enough to avoid
+    // false positives on "received biometrics letter" or "received email".
+    /\brec(?:e?ived?|eive)\s+(?:my|our)\s+ilr\b/i.test(text) ||
     /\b(approved!|granted!|successful!)\b/i.test(text) ||
     /\bapproval\s+email\s*[:\-]?\s*\d/i.test(text) ||
     /\bapproval\s+received\s*[:\-]?\s*\d/i.test(text) ||
     /\bbrp\s+(?:card\s+)?received\s*[:\-]?\s*\d/i.test(text) ||
     /\be-?visa\s+status\s+changed\s+to\s+settled/i.test(text);
 
-  // Refusal signals — careful not to match the field label "Approval/Refusal Received".
-  // We accept either an unambiguous verb ("refused", "rejected", "denied",
-  // "unsuccessful") OR the noun "refusal" when it's clearly the outcome
-  // ("Refusal received <date>").
+  // Refusal signals.
+  //
+  // The old guard `!/approval\s*\/\s*refusal/i.test(text)` was too aggressive:
+  // it suppressed refusal verbs anywhere in the post just because the field
+  // *label* "Approval/Refusal Received" was present (which it is on almost
+  // every immigrationboards timeline post). That label is now handled by the
+  // template block above, so here we accept refusal verbs freely.
   const refusalAsNounWithDate = /\brefusal\s+received\s*[:\-]?\s*\d/i.test(text);
-  const refusedVerbs =
-    /\b(refused|rejected|denied|unsuccessful)\b/i.test(text) &&
-    !/approval\s*\/\s*refusal/i.test(text);
+  const refusedVerbs = /\b(refused|rejected|denied|unsuccessful)\b/i.test(text);
   const refused = refusalAsNounWithDate || refusedVerbs;
 
   const pending =
@@ -621,51 +735,70 @@ export function parseFlexibleDate(dateStr: string): Date | undefined {
   const str = dateStr.trim();
   if (!str) return undefined;
 
-  // 1. DD/MM/YYYY, DD-MM-YYYY, DD.MM.YYYY (UK format, default).
+  const toFullYear = (y: number): number => (y < 100 ? y + 2000 : y);
+
+  const tryBuild = (year: number, month: number, day: number): Date | undefined => {
+    if (day < 1 || day > 31 || month < 0 || month > 11) return undefined;
+    const date = new Date(Date.UTC(year, month, day));
+    if (isNaN(date.getTime()) || !isReasonableDate(date)) return undefined;
+    return date;
+  };
+
+  const resolveMonthName = (raw: string): number | undefined => {
+    const key = raw.toLowerCase().replace(/\.$/, '');
+    return MONTH_NAMES[key] ?? MONTH_NAMES[key.slice(0, 3)];
+  };
+
+  // 1. DD/MM/YYYY, DD-MM-YYYY, DD.MM.YYYY (UK numeric).
   const numericMatch = str.match(/^(\d{1,2})[\s\/\-\.](\d{1,2})[\s\/\-\.](\d{2,4})$/);
   if (numericMatch) {
     const day = parseInt(numericMatch[1]!, 10);
     const month = parseInt(numericMatch[2]!, 10) - 1;
-    let year = parseInt(numericMatch[3]!, 10);
-    if (year < 100) year += 2000;
+    const year = toFullYear(parseInt(numericMatch[3]!, 10));
+    const result = tryBuild(year, month, day);
+    if (result) return result;
+  }
 
-    if (day >= 1 && day <= 31 && month >= 0 && month <= 11) {
-      const date = new Date(Date.UTC(year, month, day));
-      if (!isNaN(date.getTime()) && isReasonableDate(date)) {
-        return date;
-      }
+  // 2. "DD-Mon-YYYY" / "DD/Mon/YYYY" — month as letters with hyphens / slashes.
+  //    Common phpBB user style: "15-Feb-2018", "20/Jan/2019".
+  const hyphenatedTextMatch = str.match(/^(\d{1,2})[\-\/]([A-Za-z]{3,9})[\-\/](\d{2,4})$/);
+  if (hyphenatedTextMatch) {
+    const day = parseInt(hyphenatedTextMatch[1]!, 10);
+    const month = resolveMonthName(hyphenatedTextMatch[2]!);
+    const year = toFullYear(parseInt(hyphenatedTextMatch[3]!, 10));
+    if (month !== undefined) {
+      const result = tryBuild(year, month, day);
+      if (result) return result;
     }
   }
 
-  // 2. "D Month YYYY" — UK textual format, e.g. "3 March 2026".
-  const ukTextMatch = str.match(/^(\d{1,2})\s+(\w+)\s+(\d{4})$/i);
+  // 3. "D[th] Month YY[YY]" — UK textual. Tolerates:
+  //    - ordinal suffix on day  ("19th oct 2016")
+  //    - 2-digit year             ("08 Feb 17"  → 2017)
+  //    - month/year with no space ("19th oct16" → 16 Oct 2016)
+  //    - trailing period on abbreviated month ("19 Feb. 2018")
+  const ukTextMatch = str.match(
+    /^(\d{1,2})(?:st|nd|rd|th)?\s+([A-Za-z]{3,9})\.?\s*,?\s*(\d{2,4})$/i
+  );
   if (ukTextMatch) {
     const day = parseInt(ukTextMatch[1]!, 10);
-    const monthKey = ukTextMatch[2]!.toLowerCase();
-    const month = MONTH_NAMES[monthKey] ?? MONTH_NAMES[monthKey.slice(0, 3)];
-    const year = parseInt(ukTextMatch[3]!, 10);
-
-    if (month !== undefined && day >= 1 && day <= 31) {
-      const date = new Date(Date.UTC(year, month, day));
-      if (!isNaN(date.getTime()) && isReasonableDate(date)) {
-        return date;
-      }
+    const month = resolveMonthName(ukTextMatch[2]!);
+    const year = toFullYear(parseInt(ukTextMatch[3]!, 10));
+    if (month !== undefined) {
+      const result = tryBuild(year, month, day);
+      if (result) return result;
     }
   }
 
-  // 3. "Month D, YYYY" — US textual format, occasionally used.
-  const usTextMatch = str.match(/^(\w+)\s+(\d{1,2}),?\s+(\d{4})$/i);
+  // 4. "Month D, YYYY" — US textual format, occasionally used.
+  const usTextMatch = str.match(/^([A-Za-z]+)\.?\s+(\d{1,2}),?\s+(\d{4})$/);
   if (usTextMatch) {
-    const monthKey = usTextMatch[1]!.toLowerCase();
-    const month = MONTH_NAMES[monthKey] ?? MONTH_NAMES[monthKey.slice(0, 3)];
+    const month = resolveMonthName(usTextMatch[1]!);
     const day = parseInt(usTextMatch[2]!, 10);
     const year = parseInt(usTextMatch[3]!, 10);
-
-    if (month !== undefined && day >= 1 && day <= 31) {
-      const date = new Date(Date.UTC(year, month, day));
-      if (!isNaN(date.getTime()) && isReasonableDate(date)) {
-        return date;
-      }
+    if (month !== undefined) {
+      const result = tryBuild(year, month, day);
+      if (result) return result;
     }
   }
 
