@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
+import { useSearchParams } from 'react-router-dom';
 import { useMutation, useQuery } from '@tanstack/react-query';
 import {
   Area,
@@ -106,10 +107,18 @@ const EMPTY_FORM: FormState = {
 // ============================================
 
 export function Estimate() {
-  const [form, setForm] = useState<FormState>(EMPTY_FORM);
+  // URL params double as a sharable representation of the form. The user
+  // pastes a link or clicks Back/Forward and we reproduce the exact estimate.
+  const [searchParams, setSearchParams] = useSearchParams();
+
+  const [form, setForm] = useState<FormState>(() =>
+    parseFormFromParams(searchParams),
+  );
   // Whether the user has ever submitted — used to swap the empty-state copy
   // for the results panel after the first run.
-  const [hasSubmitted, setHasSubmitted] = useState(false);
+  const [hasSubmitted, setHasSubmitted] = useState(
+    () => !isEmptyForm(parseFormFromParams(searchParams)),
+  );
 
   // Anchor we scroll to after a successful submit on small screens, where the
   // results render below the form and would otherwise be off-screen.
@@ -133,6 +142,33 @@ export function Estimate() {
     },
   });
 
+  // Re-sync the form to the URL on real URL changes (initial mount, browser
+  // back/forward, programmatic navigation). We track the LAST key we
+  // observed so our own submits don't double-fire the mutation via this
+  // effect.
+  const lastUrlKeyRef = useRef<string | null>(null);
+  useEffect(() => {
+    const currentKey = paramsKey(searchParams);
+    if (lastUrlKeyRef.current === currentKey) return;
+    lastUrlKeyRef.current = currentKey;
+
+    const fromUrl = parseFormFromParams(searchParams);
+    setForm(fromUrl);
+
+    if (isEmptyForm(fromUrl)) {
+      // Empty URL = user navigated back to a clean state. Drop results.
+      mutation.reset();
+      setHasSubmitted(false);
+    } else {
+      setHasSubmitted(true);
+      mutation.mutate(fromUrl);
+    }
+    // We intentionally exclude `mutation` from deps: react-query's mutation
+    // object identity changes on every render and would loop us. The effect
+    // only depends on the URL key.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [searchParams]);
+
   // After we get results back on a narrow viewport (where the form sits ABOVE
   // the results stack), scroll the results into view so the user doesn't have
   // to hunt for them.
@@ -145,11 +181,26 @@ export function Estimate() {
   const submit = (e: React.FormEvent) => {
     e.preventDefault();
     setHasSubmitted(true);
+    // Mirror filters to the URL so the user can copy/share/bookmark this
+    // exact estimate. We pre-set `lastUrlKeyRef` so the searchParams effect
+    // sees this as a self-write and skips re-firing the mutation.
+    const nextParams = formToParams(form);
+    const nextKey = paramsKey(new URLSearchParams(nextParams));
+    lastUrlKeyRef.current = nextKey;
+    setSearchParams(nextParams, { replace: false });
     mutation.mutate(form);
   };
 
   const handleChange = <K extends keyof FormState>(key: K, value: FormState[K]) => {
     setForm((prev) => ({ ...prev, [key]: value }));
+  };
+
+  const handleReset = () => {
+    setForm(EMPTY_FORM);
+    mutation.reset();
+    setHasSubmitted(false);
+    lastUrlKeyRef.current = '';
+    setSearchParams({}, { replace: false });
   };
 
   return (
@@ -179,11 +230,7 @@ export function Estimate() {
           form={form}
           onChange={handleChange}
           onSubmit={submit}
-          onReset={() => {
-            setForm(EMPTY_FORM);
-            mutation.reset();
-            setHasSubmitted(false);
-          }}
+          onReset={handleReset}
           filterOptions={filterOptions}
           isLoading={mutation.isPending}
         />
@@ -1356,6 +1403,88 @@ function Disclaimers({ items }: { items: string[] }) {
       </CardContent>
     </Card>
   );
+}
+
+// ============================================
+// URL STATE
+// ============================================
+
+// Short, human-friendly URL keys so a shared link reads naturally:
+// /estimate?route=SET(M)&tier=standard&nationality=PK&location=Croydon&applied=2025-09-15
+const URL_KEYS = {
+  applicationRoute: 'route',
+  serviceTier: 'tier',
+  applicantNationalityCode: 'nationality',
+  biometricsLocation: 'location',
+  applicationDate: 'applied',
+} as const satisfies Record<keyof FormState, string>;
+
+const VALID_TIERS: ReadonlySet<ServiceTier> = new Set(
+  SERVICE_TIERS.map((t) => t.value),
+);
+const ISO2_RE = /^[A-Z]{2}$/;
+const ISO_DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
+
+function parseFormFromParams(params: URLSearchParams): FormState {
+  const next: FormState = { ...EMPTY_FORM };
+
+  const route = params.get(URL_KEYS.applicationRoute);
+  if (route) next.applicationRoute = route;
+
+  const tier = params.get(URL_KEYS.serviceTier);
+  if (tier && VALID_TIERS.has(tier as ServiceTier)) {
+    next.serviceTier = tier as ServiceTier;
+  }
+
+  const nationality = params.get(URL_KEYS.applicantNationalityCode);
+  if (nationality) {
+    const upper = nationality.toUpperCase();
+    if (ISO2_RE.test(upper)) next.applicantNationalityCode = upper;
+  }
+
+  const location = params.get(URL_KEYS.biometricsLocation);
+  if (location) next.biometricsLocation = location;
+
+  const applied = params.get(URL_KEYS.applicationDate);
+  if (applied && ISO_DATE_RE.test(applied)) {
+    // Reject obviously-bad dates like 2025-13-40 by round-tripping.
+    const parsed = new Date(applied);
+    if (!isNaN(parsed.getTime())) next.applicationDate = applied;
+  }
+
+  return next;
+}
+
+function formToParams(form: FormState): Record<string, string> {
+  const out: Record<string, string> = {};
+  if (form.applicationRoute) out[URL_KEYS.applicationRoute] = form.applicationRoute;
+  if (form.serviceTier) out[URL_KEYS.serviceTier] = form.serviceTier;
+  if (form.applicantNationalityCode)
+    out[URL_KEYS.applicantNationalityCode] = form.applicantNationalityCode;
+  if (form.biometricsLocation)
+    out[URL_KEYS.biometricsLocation] = form.biometricsLocation;
+  if (form.applicationDate) out[URL_KEYS.applicationDate] = form.applicationDate;
+  return out;
+}
+
+function isEmptyForm(form: FormState): boolean {
+  return (
+    !form.applicationRoute &&
+    !form.serviceTier &&
+    !form.applicantNationalityCode &&
+    !form.biometricsLocation &&
+    !form.applicationDate
+  );
+}
+
+// A deterministic string key for diffing URL params across renders.
+// `URLSearchParams.toString()` doesn't sort keys, so two semantically-equal
+// param sets can stringify differently — sort first.
+function paramsKey(params: URLSearchParams): string {
+  const entries: [string, string][] = [];
+  params.forEach((v, k) => entries.push([k, v]));
+  entries.sort(([a], [b]) => a.localeCompare(b));
+  return entries.map(([k, v]) => `${k}=${v}`).join('&');
 }
 
 // ============================================
