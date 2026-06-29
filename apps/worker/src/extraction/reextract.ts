@@ -33,7 +33,9 @@ interface ReextractStats {
   belowConfidence: number;
 }
 
-const MIN_CONFIDENCE = 0.3;
+// Kept in sync with the same constant in `scraper/runner.ts`. See the
+// long comment there for the rationale of the 0.25 floor.
+const MIN_CONFIDENCE = 0.25;
 
 /**
  * Re-run the current extractor against existing posts. Useful when the

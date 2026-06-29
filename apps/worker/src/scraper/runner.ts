@@ -5,8 +5,18 @@ import { extractCaseData, EXTRACTOR_VERSION } from '../extraction/extractor.js';
 import { caseDataFromExtraction, syncCaseEvents } from '../extraction/persistence.js';
 import { hashContent, delay, getJitter } from '../utils/helpers.js';
 
-/** Minimum confidence for an extracted case to be persisted. */
-const MIN_CONFIDENCE = 0.3;
+/**
+ * Minimum confidence for an extracted case to be persisted.
+ *
+ * Lowered to 0.25 in v1.9 after corpus audit: posts with appDate +
+ * biometricsDate + serviceTier + acknowledgement but no recognised
+ * route were landing at ~0.29 and being dropped, even though they are
+ * useful merge contributions (the API's `mergeCases` step will fold
+ * them into the original applicant's case at query time). The
+ * extractor has its own 0.4 floor for confirmed-decision rows, so
+ * loosening this gate doesn't admit pure noise.
+ */
+const MIN_CONFIDENCE = 0.25;
 
 interface RunScraperOptions {
   source: SourceForum;
@@ -212,6 +222,15 @@ export async function runScraper(options: RunScraperOptions): Promise<void> {
           console.log(`  Resuming from page ${startFromPage}`);
         }
 
+        // Snapshot of the prior resume pointer so we can decide whether to
+        // overwrite it. A --from-page jump that lands beyond the existing
+        // pointer would otherwise mark the gap pages "done" even though
+        // they were never scraped (the historic bug behind the 13/162
+        // coverage problem in the live DB).
+        const priorLastScrapedPage = dbThread?.lastScrapedPage ?? 0;
+        const jumpedAheadWithFromPage =
+          !!fromPage && fromPage > 0 && startFromPage > priorLastScrapedPage + 1;
+
         // Step 3: Scrape posts with streaming — each page is written to DB as it arrives
         let allPostsProcessed = 0;
         let allCasesExtracted = 0;
@@ -247,11 +266,17 @@ export async function runScraper(options: RunScraperOptions): Promise<void> {
           // Called with progress for saving resume state
           onProgress: async (prog: ScrapeProgress) => {
             if (!dryRun && dbThread && prog.lastScrapedPage % PAGES_PER_CHUNK === 0) {
+              // If --from-page jumped past the prior pointer, never advance
+              // lastScrapedPage forward — that would mark the unscraped gap
+              // as "done". `totalPages` is still safe to refresh.
+              const safeLastScrapedPage = jumpedAheadWithFromPage
+                ? priorLastScrapedPage
+                : prog.lastScrapedPage;
               await retryWithBackoff(
                 () => prisma.thread.update({
                   where: { id: dbThread.id },
                   data: {
-                    lastScrapedPage: prog.lastScrapedPage,
+                    lastScrapedPage: safeLastScrapedPage,
                     totalPages: prog.totalPages,
                   },
                 }),
@@ -282,11 +307,16 @@ export async function runScraper(options: RunScraperOptions): Promise<void> {
 
         // Update final progress
         if (!dryRun && dbThread && !shouldStop()) {
+          // Same guard as in onProgress: don't let a --from-page jump
+          // pretend the skipped middle pages are done.
+          const safeLastScrapedPage = jumpedAheadWithFromPage
+            ? priorLastScrapedPage
+            : progress.lastScrapedPage;
           await retryWithBackoff(
             () => prisma.thread.update({
               where: { id: dbThread.id },
               data: {
-                lastScrapedPage: progress.lastScrapedPage,
+                lastScrapedPage: safeLastScrapedPage,
                 totalPages: progress.totalPages,
                 lastScrapedAt: new Date(),
               },

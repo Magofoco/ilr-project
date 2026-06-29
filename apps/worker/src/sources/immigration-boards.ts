@@ -78,6 +78,10 @@ export function createImmigrationBoardsAdapter(source: SourceForum): SourceAdapt
 
     const rawUrl = config.threadUrl || 'https://www.immigrationboards.com/viewtopic.php?t=231555';
     
+    // immigrationboards.com renders 25 posts per page (verified against the
+    // live HTML). Don't override this in source.config unless the forum
+    // setting changes; an off-by-one offset would silently skip one post
+    // per page on every scrape.
     return {
       threadUrl: stripSessionId(rawUrl),
       postsPerPage: config.postsPerPage || 25,
@@ -428,6 +432,12 @@ export function createImmigrationBoardsAdapter(source: SourceForum): SourceAdapt
       // <div id="post_content_XXXXX"> body. The old selector
       // ('.post, div[id^="p"]') matched BOTH containers because
       // post_content_* also starts with 'p', so every post was double-counted.
+      //
+      // We then filter the matches to id /^p\d+$/. The CSS attribute
+      // selector `[id^="p"]` is permissive — it also accepts ids like
+      // `page-header`, `page-body`, or `post_content_NNN`. A previous
+      // scraper run let 5 such rows into the DB; refuse them at source
+      // so re-scrapes can't reintroduce them.
       const postElements = document.querySelectorAll('div.post[id^="p"]');
 
       postElements.forEach((postEl: Element, i: number) => {
@@ -435,11 +445,10 @@ export function createImmigrationBoardsAdapter(source: SourceForum): SourceAdapt
         let externalId: string | null = null;
 
         const elId = postEl.getAttribute('id');
-        // Defence-in-depth: even though the selector above shouldn't return
-        // post_content_* elements, refuse them explicitly. We had to delete
-        // 286 such duplicate posts from the DB in 2026 after the old selector
-        // double-matched them; the guard keeps us from regressing.
-        if (elId?.startsWith('p') && !elId.startsWith('post_content')) {
+        // Defence-in-depth: only accept ids that look exactly like a phpBB
+        // post id ("p" + digits). Drops post_content_*, page-*, and any
+        // other accidental matches the CSS prefix selector caught.
+        if (elId && /^p\d+$/.test(elId)) {
           externalId = elId;
         }
 
@@ -454,8 +463,12 @@ export function createImmigrationBoardsAdapter(source: SourceForum): SourceAdapt
           }
         }
 
+        // No usable id at all — skip this match entirely rather than
+        // synthesising "pageN-postI", which is an unstable key that
+        // varies between runs and pollutes dedup. If we hit this branch
+        // it's noise (page-header, etc.); see selector guard above.
         if (!externalId) {
-          externalId = `page${pgNum}-post${i}`;
+          return;
         }
 
         // 2. Get content HTML (to be stripped in Node)
@@ -474,32 +487,62 @@ export function createImmigrationBoardsAdapter(source: SourceForum): SourceAdapt
         // 5. Get post date — when this post was made on the forum.
         //
         // The phpBB skin on immigrationboards.com renders the post header as:
-        //     <p class="author">Post by <strong>USER</strong> » Fri Mar 27, 2026 9:39 pm</p>
-        // with no <time> element. We previously matched only on <time>, which
-        // returned null for every post.
+        //     <p class="author">
+        //       <a class="unread" title="Post"><i class="icon"></i><span class="sr-only">Post</span></a>
+        //       <span class="responsive-hide">by <strong><a class="username">USER</a></strong> &raquo; </span>
+        //       Thu Sep 18, 2025 5:27 pm
+        //     </p>
+        // with no <time> element, so the visible date text is the bare text
+        // node trailing the .responsive-hide span. There can be MORE than one
+        // "»" character in some skin variants (e.g. when a permalink anchor
+        // is interleaved between the username and the date), so we match the
+        // LAST "»" rather than the first.
         //
         // We MUST avoid the .postprofile sidebar — it contains the user's
         // "Joined: <date>" registration date, which is not the post date.
         let dateIso: string | null = null;
         let dateText: string | null = null;
 
-        // Try a <time> element scoped to the post body first (some skins do
-        // have it). Deliberately exclude .postprofile.
-        const bodyTimeEl = postEl.querySelector('.postbody time, .author time');
+        // Try a <time datetime="..."> element scoped to the post body first
+        // (some skins do have it). Deliberately exclude .postprofile.
+        const bodyTimeEl = postEl.querySelector('.postbody time, .postbody .author time');
         if (bodyTimeEl) {
           dateIso = bodyTimeEl.getAttribute('datetime');
           if (!dateIso) dateText = bodyTimeEl.textContent?.trim() || null;
         }
 
-        // Fallback: parse the text after "»" in the post-body author line.
-        // The phpBB markup convention is robust across versions: the body's
-        // author paragraph always starts "Post by USER »" followed by date.
+        // Primary: read the bare trailing text node of <p class="author">.
+        // It's the cleanest place to find the date because the surrounding
+        // username/permalink are in nested elements. Iterating childNodes
+        // avoids any whitespace / icon-text noise from the upstream nodes.
         if (!dateIso && !dateText) {
-          const authorP = postEl.querySelector('.postbody .author, .postbody p.author');
-          const authorText = authorP?.textContent?.trim() ?? '';
-          // "Post by USER » Fri Mar 27, 2026 9:39 pm"
-          const match = authorText.match(/»\s*(.+?)\s*$/);
-          if (match?.[1]) dateText = match[1];
+          const authorP = postEl.querySelector('.postbody p.author, .postbody .author');
+          if (authorP) {
+            for (let i = authorP.childNodes.length - 1; i >= 0; i--) {
+              const node = authorP.childNodes[i];
+              if (!node || node.nodeType !== 3 /* TEXT_NODE */) continue;
+              const raw = (node.textContent ?? '').replace(/\s+/g, ' ').trim();
+              if (raw && /\d/.test(raw)) {
+                // Strip any leading "by USER » " noise that some skins keep
+                // in the trailing text node alongside the date.
+                dateText = raw.replace(/^.*»\s*/, '').trim() || null;
+                if (dateText) break;
+              }
+            }
+          }
+        }
+
+        // Fallback: collapse the whole author paragraph to plain text and
+        // grab whatever follows the LAST "»". Handles skins that put the
+        // date inside a wrapper rather than as a bare text node.
+        if (!dateIso && !dateText) {
+          const authorP = postEl.querySelector('.postbody p.author, .postbody .author');
+          const authorText = (authorP?.textContent ?? '').replace(/\s+/g, ' ').trim();
+          const idx = authorText.lastIndexOf('»');
+          if (idx >= 0) {
+            const tail = authorText.slice(idx + 1).trim();
+            if (tail && /\d/.test(tail)) dateText = tail;
+          }
         }
 
         results.push({ externalId, contentHtml, authorName, authorNationality, dateIso, dateText });
@@ -752,12 +795,27 @@ export function createImmigrationBoardsAdapter(source: SourceForum): SourceAdapt
           (aborted ? ' (aborted due to failures)' : '')
         );
         
+        // Resume pointer must reflect what we actually scraped this run,
+        // NOT what exists upstream. Setting lastScrapedPage = totalPages
+        // after a partial scrape (e.g. --from-page 160 --max-pages 3) is
+        // what caused 149 middle pages of the live thread to silently
+        // never be covered: the next default run resumed at totalPages
+        // and immediately exited.
+        //
+        //   - successful run from startFromPage..lastPageToScrape:
+        //     report lastPageToScrape (the highest page we covered).
+        //   - aborted run: report the last page that produced posts
+        //     without piling failures on top.
+        //
+        // The DB's `lastScrapedPage` is interpreted by `runner.ts` as
+        // "resume from here next time", so this MUST be conservative.
+        const lastSuccessfullyScraped = aborted
+          ? Math.max(startFromPage, currentPage - consecutiveFailures)
+          : lastPageToScrape;
         return {
           totalPosts: totalPostsScraped,
           progress: {
-            lastScrapedPage: aborted
-              ? currentPage - consecutiveFailures
-              : totalPages,
+            lastScrapedPage: lastSuccessfullyScraped,
             totalPages,
           },
           aborted,
@@ -765,11 +823,14 @@ export function createImmigrationBoardsAdapter(source: SourceForum): SourceAdapt
       } catch (error) {
         const totalElapsed = (Date.now() - startTime) / 1000;
         console.error(`  Error scraping thread at page ${currentPage} after ${formatDuration(totalElapsed)}:`, error);
-        
+
+        // Same conservatism as above — on a thrown error, only report the
+        // last page that actually produced posts. startFromPage - 1 is the
+        // honest floor (we processed nothing this run).
         return {
           totalPosts: totalPostsScraped,
           progress: {
-            lastScrapedPage: Math.max(currentPage - 1, startFromPage),
+            lastScrapedPage: Math.max(currentPage - 1, startFromPage - 1),
             totalPages,
           },
           aborted: true,

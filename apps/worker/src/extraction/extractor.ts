@@ -21,8 +21,27 @@ import { normalizeNationality } from '@ilr/shared';
  *       add "Document received by HO" as acknowledgement;
  *       widen biometrics-location whitelist scan to the whole post when a
  *       biometrics date was found.
+ * 1.8 — allow up to ~40 chars of free-text glue between the decision label
+ *       and the date ("Approval email received on 18/07/25",
+ *       "BRP card received on 28/06/2018", "Decision received on 12/03/2026").
+ *       Patterns previously required the date to sit immediately after the
+ *       keyword, which dropped the bulk of self-update posts on the forum.
+ *       Add a confidence floor of 0.4 for posts that carry both a decision
+ *       date AND an explicit approval/rejection signal — those are useful
+ *       merge contributions even when they don't repeat the original
+ *       application metadata.
+ * 1.9 — add bare-verb decision patterns ("Approved today 14/01/2025",
+ *       "ILR approved on 09 October") to the lenient DECISION_PATTERNS;
+ *       confine route detection to the "Applied for ILR Route:" field
+ *       when that field is present, so a body-text mention of a previous
+ *       visa ("I was on Tier 2 before applying via Ancestry") doesn't
+ *       mis-classify the case; lower MIN_CONFIDENCE-equivalent floor
+ *       awareness in the comment trail (the persistence threshold itself
+ *       lives in the runner/reextract callers — adjusted there to 0.25
+ *       so a post with appDate + bioDate + tier + acknowledgement but no
+ *       route still lands as a usable case).
  */
-export const EXTRACTOR_VERSION = '1.7';
+export const EXTRACTOR_VERSION = '1.9';
 
 /**
  * Extract ILR case data from a forum post.
@@ -180,6 +199,25 @@ export function extractCaseData(content: string, authorNationality?: string): Ex
 
   result.confidence = Math.min(score / maxScore, 1);
 
+  // Confidence floor for confirmed decisions. A post that says
+  // "Approval email received 18/07/25" carries the single most important
+  // signal a case can have — its outcome — but with the strict per-field
+  // scoring it lands at ~0.21 (decisionDate +1.5, outcome=approved +1.0,
+  // out of 12) and gets dropped by the persistence threshold (0.3). The
+  // case-merge layer at the API would happily fold this into the
+  // applicant's original (still-pending) row, so we want it persisted.
+  //
+  // Floor only applies when BOTH the decision date and an explicit
+  // approved/rejected verdict are present — that's a sufficient signal
+  // pair that this is a genuine outcome update, not a tangent ("I refuse
+  // to fill in the new fee schedule" must not bump confidence).
+  if (
+    result.decisionDate &&
+    (result.outcome === 'approved' || result.outcome === 'rejected')
+  ) {
+    result.confidence = Math.max(result.confidence, 0.4);
+  }
+
   if (result.confidence > 0 && result.confidence < 0.4) {
     notes.push('Low confidence extraction — manual review recommended');
   }
@@ -201,13 +239,32 @@ interface RouteMatch {
 }
 
 function extractRoute(content: string): RouteMatch | undefined {
-  // First try the explicit "Applied for ILR Route : ..." line and look at
-  // the values in parens / after the SET label, since that's where the
-  // sub-route hides (e.g. "Set (O) (Skilled Worker)").
+  // Read the explicit "Applied for ILR Route : ..." line if present —
+  // this is the canonical place to state the route on the
+  // immigrationboards timeline template. When the field is there, we
+  // ONLY scan its value: posts often mention prior visas in the body
+  // ("I was on Tier 2 before applying via Ancestry") which the v1.8
+  // body-scan was happy to mis-classify on.
+  //
+  // When the field is absent (free-text posts), we fall back to a
+  // full-content scan as before.
   const fieldMatch = content.match(/applied\s+for\s+ilr\s+route\s*[:\-]?\s*([^\n\r]+)/i);
   const fieldValue = fieldMatch?.[1] ?? '';
-  const haystack = (fieldValue + ' ' + content).toLowerCase();
+  const haystack = (fieldValue ? fieldValue : content).toLowerCase();
 
+  const match = matchRouteFromHaystack(haystack);
+  if (match) return match;
+
+  // If the field was present but didn't match any known route, do NOT
+  // fall back to the body — the user explicitly stated their route and
+  // we just don't recognise it (better to return undefined than to
+  // guess from unrelated body context).
+  if (fieldValue) return undefined;
+
+  return undefined;
+}
+
+function matchRouteFromHaystack(haystack: string): RouteMatch | undefined {
   // Sub-route detection (more specific first).
   if (/\bbn\s*\(?o\)?|british\s+national\s*\(\s*overseas\s*\)/i.test(haystack)) {
     return { route: 'BN(O)', type: 'ILR' };
@@ -240,6 +297,10 @@ function extractRoute(content: string): RouteMatch | undefined {
   // so it wins when the post mentions both (e.g. "Set(O) - 10 year route").
   if (/\b10[\s\-]?year|long.?residence|2\s*x\s*3|\bdlr\b/i.test(haystack)) {
     return { route: '10-year', type: 'ILR' };
+  }
+  // Catch "Ancestry to ILR" / "UK Ancestry" before the SET(O) catch-all.
+  if (/\bancestry\b/i.test(haystack)) {
+    return { route: 'Ancestry', type: 'ILR' };
   }
   if (/\bset\s*\(?\s*[o0]\s*\)?/i.test(haystack)) {
     // SET(O) is a catch-all for work routes; we already checked for sub-routes
@@ -320,6 +381,25 @@ function buildPatterns(prefixes: string[]): RegExp[] {
   );
 }
 
+/**
+ * Same as buildPatterns but tolerates up to ~40 chars of free-text glue
+ * between the keyword and the date — needed for natural phrasings like
+ * "Approval email received on 18/07/25" or "BRP card received on
+ * 28/06/2018", where the date is preceded by a connector ("on", "today
+ * was", etc.) that a strict pattern would skip over. The cap is kept
+ * tight and we forbid newlines / sentence breaks so a single keyword
+ * can't reach across unrelated milestones.
+ */
+function buildLenientPatterns(prefixes: string[]): RegExp[] {
+  return prefixes.map(
+    (prefix) =>
+      new RegExp(
+        prefix + String.raw`[^\n\r.]{0,40}?` + DATE_REGEX_FRAGMENT,
+        'i'
+      )
+  );
+}
+
 const APPLICATION_PATTERNS = buildPatterns([
   String.raw`(?:date\s+)?application\s+sent`,
   String.raw`application\s+submitted\s+online`,
@@ -369,8 +449,16 @@ const DOCS_SUBMITTED_PATTERNS = buildPatterns([
 // match it greedily here; the outcome inference logic uses the value
 // (e.g. "Rejected on …") to decide approved vs rejected, and clears the
 // decision date if the value is actually "waiting".
-const DECISION_PATTERNS = buildPatterns([
-  String.raw`approval\s+(?:email|received|date)`,
+//
+// v1.8: patterns moved to buildLenientPatterns so the date can sit a
+// few words after the keyword (e.g. "Approval email received on
+// 18/07/25", "BRP card received on 28/06/2018", "Decision received on
+// 12/03/2026"). Strict immediate-date matching dropped the bulk of the
+// self-update posts on the live thread — those are the posts that
+// announce the case outcome and are crucial for KM to mark a row as
+// decided rather than leaving it censored forever.
+const DECISION_PATTERNS = buildLenientPatterns([
+  String.raw`approval\s+(?:email|letter|notification|received|date|granted)`,
   // The "Approval/Refusal Received : <date>" template, with optional
   // free-text filler between the colon and the date so phrasings like
   // "Approval/Refusal Received : Rejected on 07/02/2018" or
@@ -383,10 +471,25 @@ const DECISION_PATTERNS = buildPatterns([
   String.raw`approval[\/\s]+refusal\s+received[^\n\r]{0,80}?`,
   // Bare "refusal received <date>" / "rejected <date>" etc. Kept distinct
   // from the label above so a value-only refusal line still matches.
-  String.raw`(?:refusal|refused|rejected|denied)\s+(?:email|received|date|on)?`,
+  String.raw`(?:refusal|refused|rejected|denied)\s+(?:email|letter|received|date|on)?`,
   String.raw`decision\s+(?:received|date|email|made|on)`,
   String.raw`brp\s+(?:card\s+)?received`,
-  String.raw`e-?visa\s+(?:status\s+)?(?:changed|updated)\s+to\s+settled\s+on`,
+  // "BRP delivered on Friday 31 August 2018", "BRP arrived 12/03/2026" —
+  // for posts that confirm decision by reporting the BRP arrival.
+  String.raw`brp\s+(?:card\s+)?(?:delivered|arrived|came|dispatched)`,
+  String.raw`e-?visa\s+(?:status\s+)?(?:changed|updated)\s+to\s+settled\s+on?`,
+  // "Got approval on …" / "Got my ILR on …" / "Received approval on …" —
+  // common free-text update phrasings. Note: "got/received" alone is too
+  // generic, so we require a follow-on noun (approval/ILR/visa/decision).
+  String.raw`(?:got|received|granted)\s+(?:my\s+|our\s+)?(?:approval|ilr|visa|decision|settlement)`,
+  // Bare verb phrasings: "Approved today 14/01/2025", "ILR approved on
+  // 09/10/2024", "Visa approved DATE", "Granted on DATE". We require a
+  // date within the 40-char window of buildLenientPatterns, so a stray
+  // "approved by HR" in unrelated context won't match (no nearby date).
+  // The word boundary + verb form makes this safe in practice.
+  String.raw`(?:ilr|visa|application|case)\s+approved`,
+  String.raw`\bapproved\b`,
+  String.raw`\bgranted\b`,
 ]);
 
 function extractDateField(content: string, patterns: RegExp[]): Date | undefined {
@@ -666,7 +769,13 @@ function inferOutcome(content: string, hasDecisionDate: boolean): 'approved' | '
   // *label* "Approval/Refusal Received" was present (which it is on almost
   // every immigrationboards timeline post). That label is now handled by the
   // template block above, so here we accept refusal verbs freely.
-  const refusalAsNounWithDate = /\brefusal\s+received\s*[:\-]?\s*\d/i.test(text);
+  //
+  // v1.8: the noun-with-date check allows a few words of glue ("Refusal
+  // received on 07/02/2018", "Refusal letter received 12 March 2026") —
+  // previously it required the date immediately after "received", which
+  // silently misclassified those as approved via the hasDecisionDate
+  // fallback below.
+  const refusalAsNounWithDate = /\brefusal\s+(?:letter\s+)?received\b[^\n\r.]{0,30}?\d/i.test(text);
   const refusedVerbs = /\b(refused|rejected|denied|unsuccessful)\b/i.test(text);
   const refused = refusalAsNounWithDate || refusedVerbs;
 
